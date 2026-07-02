@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Generated installer output and local deployment state.
+build/
+.vpn-state/
+
+# Local secrets: SSH/WireGuard/API tokens must never be committed.
+.vpn-secrets/
+*.secrets.json
+*.key
+NUL

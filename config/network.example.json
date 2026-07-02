@@ -1,0 +1,35 @@
+{
+  "productVersion": 1,
+  "admin": {
+    "configured": false,
+    "lastLogin": ""
+  },
+  "ingress": {
+    "name": "primary-ingress",
+    "host": "",
+    "sshUser": "root",
+    "domain": "",
+    "publicIp": "",
+    "publicInterface": "eth0",
+    "clientSourceIp": "10.42.42.42",
+    "wgPort": 51820,
+    "hysteriaUser": "hysteria"
+  },
+  "routing": {
+    "tableId": 100,
+    "reserveTableId": 101,
+    "mark": "0x77",
+    "reserveMark": "0x78",
+    "directDomains": [],
+    "reserveDomains": []
+  },
+  "protocols": {
+    "wireguard": true,
+    "hysteria": true,
+    "mtproto": false,
+    "clientPortal": true,
+    "monitoring": true
+  },
+  "users": [],
+  "exits": []
+}
