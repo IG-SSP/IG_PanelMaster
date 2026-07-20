@@ -140,6 +140,7 @@ def update_donation_accounting(observed_total=None, timestamp=None):
         "donation_raised_rub",
         "donation_daily_cost_rub",
         "donation_source_total_rub",
+        "donation_manual_total_rub",
         "donation_reserve_millirub",
         "donation_spent_millirub",
         "donation_accounted_at",
@@ -148,7 +149,7 @@ def update_donation_accounting(observed_total=None, timestamp=None):
     with DONATION_LOCK, portal_db() as db:
         db.execute("begin immediate")
         rows = db.execute(
-            "select key,value from app_state where key in (?,?,?,?,?,?,?)",
+            "select key,value from app_state where key in (?,?,?,?,?,?,?,?)",
             keys,
         ).fetchall()
         values = {row["key"]: row["value"] for row in rows}
@@ -158,12 +159,13 @@ def update_donation_accounting(observed_total=None, timestamp=None):
         reserve_milli = donation_state_int(values, "donation_reserve_millirub", manual_raised * 1000)
         spent_milli = donation_state_int(values, "donation_spent_millirub", 0)
         source_total = donation_state_int(values, "donation_source_total_rub", manual_raised, 0, MAX_DONATION_RUB)
+        manual_total = donation_state_int(values, "donation_manual_total_rub", 0, 0, MAX_DONATION_RUB)
         accounted_at = donation_state_int(values, "donation_accounted_at", current_time, 0, 4_102_444_800)
         remainder = donation_state_int(values, "donation_burn_remainder", 0, 0, 86_399)
 
         if observed_total is not None and "donation_source_total_rub" not in values:
             source_total = max(0, min(int(observed_total), MAX_DONATION_RUB))
-            reserve_milli = source_total * 1000
+            reserve_milli = min(MAX_DONATION_RUB * 1000, (source_total + manual_total) * 1000)
             spent_milli = 0
             accounted_at = current_time
             remainder = 0
@@ -188,6 +190,7 @@ def update_donation_accounting(observed_total=None, timestamp=None):
             updated = (
                 ("donation_raised_rub", str(reserve_milli // 1000)),
                 ("donation_source_total_rub", str(source_total)),
+                ("donation_manual_total_rub", str(manual_total)),
                 ("donation_reserve_millirub", str(reserve_milli)),
                 ("donation_spent_millirub", str(spent_milli)),
                 ("donation_accounted_at", str(accounted_at)),
@@ -199,7 +202,7 @@ def update_donation_accounting(observed_total=None, timestamp=None):
             )
         return {
             "raised": reserve_milli // 1000,
-            "total": source_total,
+            "total": min(MAX_DONATION_RUB, source_total + manual_total),
             "spent": spent_milli // 1000,
             "daily": daily,
             "tracked": tracked,
@@ -233,6 +236,54 @@ def donation_snapshot():
         "days_text": days_text,
         "url": safe_https_url(DONATION_URL),
     }
+
+
+def add_manual_donation(amount, note="", created_by=""):
+    amount = int(amount or 0)
+    if amount < 1 or amount > MAX_DONATION_RUB:
+        raise ValueError("invalid donation amount")
+    update_donation_accounting()
+    with DONATION_LOCK, portal_db() as db:
+        db.execute("begin immediate")
+        rows = db.execute(
+            "select key,value from app_state where key in "
+            "('donation_raised_rub','donation_source_total_rub','donation_manual_total_rub',"
+            "'donation_reserve_millirub','donation_spent_millirub','donation_burn_remainder')"
+        ).fetchall()
+        values = {row["key"]: row["value"] for row in rows}
+        legacy_raised = donation_state_int(values, "donation_raised_rub", DONATION_RAISED_RUB, 0, MAX_DONATION_RUB)
+        source_total = donation_state_int(values, "donation_source_total_rub", legacy_raised, 0, MAX_DONATION_RUB)
+        reserve_milli = donation_state_int(values, "donation_reserve_millirub", legacy_raised * 1000)
+        manual_total = donation_state_int(values, "donation_manual_total_rub", 0, 0, MAX_DONATION_RUB)
+        spent_milli = donation_state_int(values, "donation_spent_millirub", 0)
+        remainder = donation_state_int(values, "donation_burn_remainder", 0, 0, 86_399)
+        reserve_milli = min(MAX_DONATION_RUB * 1000, reserve_milli + amount * 1000)
+        manual_total = min(MAX_DONATION_RUB, manual_total + amount)
+        db.executemany(
+            "insert into app_state(key,value) values(?,?) on conflict(key) do update set value=excluded.value",
+            (
+                ("donation_raised_rub", str(reserve_milli // 1000)),
+                ("donation_source_total_rub", str(source_total)),
+                ("donation_reserve_millirub", str(reserve_milli)),
+                ("donation_manual_total_rub", str(manual_total)),
+                ("donation_spent_millirub", str(spent_milli)),
+                ("donation_accounted_at", str(int(time.time()))),
+                ("donation_burn_remainder", str(remainder)),
+            ),
+        )
+        db.execute(
+            "insert into manual_donations(amount,note,created_by,created_at) values(?,?,?,?)",
+            (amount, (note or "").strip()[:160], (created_by or "").strip()[:32], now()),
+        )
+    return donation_snapshot()
+
+
+def list_manual_donations(limit=8):
+    with portal_db() as db:
+        return db.execute(
+            "select amount,note,created_by,created_at from manual_donations order by id desc limit ?",
+            (max(1, min(int(limit or 8), 50)),),
+        ).fetchall()
 
 
 def parse_cloudtips_total(payload):
@@ -535,6 +586,17 @@ def init_db():
             create table if not exists app_state (
               key text primary key,
               value text not null
+            )
+            """
+        )
+        db.execute(
+            """
+            create table if not exists manual_donations (
+              id integer primary key autoincrement,
+              amount integer not null,
+              note text default '',
+              created_by text default '',
+              created_at text not null
             )
             """
         )
@@ -1372,26 +1434,27 @@ def page(title, body):
 <title>{html.escape(title)}</title>
 <style>
 :root{{--ink:#e7f3ff;--muted:#8ea9c4;--sky:#020812;--panel:#061426;--panel2:#04111f;--line:#173f65;--mint:#4ebeff;--sun:#83dfff;--pink:#ff72a5;--shadow:#01040a;--danger:#ff8da9;color-scheme:dark}}
-*{{box-sizing:border-box}}html{{background:var(--sky)}}body{{margin:0;min-height:100vh;background:var(--sky);color:var(--ink);font-family:"Courier New",ui-monospace,monospace;background-image:linear-gradient(rgba(63,137,196,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(63,137,196,.04) 1px,transparent 1px);background-size:16px 16px}}body:after{{content:"";position:fixed;inset:0;z-index:20;pointer-events:none;background:repeating-linear-gradient(180deg,transparent 0 3px,rgba(0,0,0,.045) 3px 4px)}}main{{position:relative;width:min(1120px,100%);margin:0 auto;padding:18px 20px 52px}}
-.site-head{{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:62px;margin-bottom:14px;border:2px solid var(--line);background:#04111f;padding:10px 14px;box-shadow:5px 5px 0 var(--shadow)}}.brand{{display:flex;align-items:center;gap:10px;color:var(--ink);font-weight:900;text-decoration:none;letter-spacing:.08em}}.brand-mark{{display:grid;place-items:center;width:34px;height:34px;border:2px solid var(--sun);background:#09213a;color:var(--sun);box-shadow:3px 3px 0 var(--shadow)}}.site-status{{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}}.status-led{{width:9px;height:9px;background:var(--sun);box-shadow:0 0 9px var(--sun);animation:blink 1.8s steps(2,end) infinite}}
-.network-strip{{position:relative;height:94px;margin-bottom:22px;overflow:hidden;border:2px solid var(--line);background:linear-gradient(180deg,#030c19,#071c31);box-shadow:7px 7px 0 var(--shadow)}}.network-strip:before{{content:"";position:absolute;inset:0;background-image:radial-gradient(circle,var(--sun) 1px,transparent 2px);background-size:37px 31px;opacity:.45}}.route-caption{{position:absolute;top:7px;left:12px;color:#5c8db4;font-size:9px;letter-spacing:.12em;text-transform:uppercase}}.network-line{{position:absolute;left:9%;right:9%;top:42px;height:4px;background:repeating-linear-gradient(90deg,#245f90 0 10px,transparent 10px 17px)}}.pixel-node{{position:absolute;top:31px;width:26px;height:26px;border:3px solid var(--sun);background:#051326;box-shadow:4px 4px 0 var(--shadow)}}.pixel-node:after{{position:absolute;top:31px;left:50%;transform:translateX(-50%);color:#79b5dd;font:700 9px/1 "Courier New",monospace;letter-spacing:.08em;white-space:nowrap}}.pixel-node.n1{{left:8%;animation:nodeClient 7s steps(2,end) infinite}}.pixel-node.n1:after{{content:"УСТРОЙСТВО"}}.pixel-node.n2{{left:calc(50% - 13px);animation:nodeFund 7s steps(2,end) infinite}}.pixel-node.n2:after{{content:"ФОНД"}}.pixel-node.n3{{right:8%;animation:nodeInternet 7s steps(2,end) infinite}}.pixel-node.n3:after{{content:"ИНТЕРНЕТ"}}.data-packet{{position:absolute;z-index:2;top:36px;left:calc(8% + 7px);width:12px;height:12px;background:var(--pink);box-shadow:0 0 8px var(--pink);animation:packetOut 7s steps(28,end) infinite}}.data-packet.response{{left:calc(92% - 19px);background:var(--sun);box-shadow:0 0 8px var(--sun);animation:packetBack 7s steps(28,end) infinite}}
-h1{{margin:22px 0 14px;max-width:900px;color:var(--ink);font-size:clamp(30px,5vw,50px);line-height:1;letter-spacing:-.055em;text-wrap:balance}}h2{{font-size:22px;margin:24px 0 11px}}h3{{font-size:16px;margin:18px 0 8px}}p{{line-height:1.55}}a{{color:var(--sun)}}form,.card,table{{background:var(--panel);border:2px solid var(--line);border-radius:0;padding:18px;box-shadow:7px 7px 0 var(--shadow)}}.hero{{display:grid;grid-template-columns:.78fr 1.22fr;gap:18px;align-items:stretch;margin-bottom:18px}}.status{{position:relative;min-height:210px;overflow:hidden;background:linear-gradient(135deg,#061426,#09213a);border-color:#28618e}}.status:after{{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 0%,rgba(131,223,255,.08) 42%,transparent 64%);transform:translateX(-100%);animation:sheen 5s steps(18,end) infinite;pointer-events:none}}
-.support{{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.72fr);gap:20px;align-items:center;margin-bottom:20px;border-color:#2b78aa;background:#06182d}}.support-copy b{{display:block;color:var(--sun);font-size:17px;text-transform:uppercase;letter-spacing:.04em}}.support-copy p{{margin:9px 0 0}}.fund-panel{{border-left:2px dashed #245f90;padding-left:20px}}.fund-numbers{{display:flex;align-items:end;justify-content:space-between;gap:14px;margin-bottom:9px}}.fund-numbers strong{{color:var(--sun);font-size:22px}}.fund-numbers span{{color:var(--muted);font-size:11px;text-align:right}}.fund-progress{{height:22px;border:3px solid var(--ink);background:#07171b;padding:3px}}.fund-progress span{{display:block;height:100%;background:repeating-linear-gradient(90deg,var(--sun) 0 11px,#2c77a8 11px 14px);animation:load .8s steps(10,end) both}}.fund-meta{{display:flex;justify-content:space-between;gap:10px;margin:8px 0 0;color:var(--muted);font-size:11px}}.fund-actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:10px}}
-.steps,.guide-grid{{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:12px;margin:14px 0}}.step,.guide-card,.protocol-card,.metric{{background:var(--panel2);border:2px solid var(--line);border-radius:0;padding:14px;box-shadow:4px 4px 0 var(--shadow)}}.step{{min-height:126px}}.step b,.guide-card b{{display:block;margin-bottom:6px;color:var(--ink)}}.guide{{margin:20px 0}}.guide-card .num{{display:inline-grid;place-items:center;width:28px;height:28px;border:2px solid var(--sun);background:#09213a;color:var(--sun);font-weight:700;margin-bottom:10px}}.pill{{display:inline-block;border:2px solid #2d78a8;background:#09213a;color:var(--sun);padding:5px 9px;font-size:11px;text-transform:uppercase;letter-spacing:.06em}}.actions{{display:flex;flex-wrap:wrap;gap:10px;align-items:center}}
-label{{display:block;color:#b2c7dc;margin:12px 0 6px}}input,textarea,select{{width:100%;border:2px solid #28587c;border-radius:0;background:#020b15;color:var(--ink);padding:12px;font:inherit;outline:none}}input:focus,textarea:focus,select:focus{{border-color:var(--sun);box-shadow:0 0 0 2px rgba(131,223,255,.16)}}button,.btn{{display:inline-block;min-height:44px;border:2px solid #bcecff;border-radius:0;background:var(--mint);color:#04182b;padding:10px 14px;font:900 13px/1.35 "Courier New",monospace;text-decoration:none;cursor:pointer;margin-top:12px;box-shadow:4px 4px 0 var(--shadow);transition:transform .1s steps(2,end),filter .1s}}button:hover,.btn:hover{{filter:brightness(1.12);transform:translate(-1px,-1px)}}button:active,.btn:active{{transform:translate(3px,3px);box-shadow:1px 1px 0 var(--shadow)}}.btn.secondary,button.secondary{{background:#173a5a;color:var(--ink);border-color:#386e99}}.btn.good{{background:var(--pink);color:#240713;border-color:#ffc0d7}}.btn[aria-busy="true"],button[aria-busy="true"]{{opacity:.75;pointer-events:none}}.btn[aria-busy="true"]:before,button[aria-busy="true"]:before{{content:"";display:inline-block;width:12px;height:12px;margin-right:8px;border:2px solid currentColor;border-top-color:transparent;vertical-align:-2px;animation:spin .7s steps(8,end) infinite}}
+*{{box-sizing:border-box}}html{{background:var(--sky)}}body{{margin:0;min-height:100vh;overflow-x:hidden;background:var(--sky);color:var(--ink);font-family:"Courier New",ui-monospace,monospace;background-image:linear-gradient(rgba(63,137,196,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(63,137,196,.04) 1px,transparent 1px);background-size:16px 16px}}body:after{{content:"";position:fixed;inset:0;z-index:20;pointer-events:none;background:repeating-linear-gradient(180deg,transparent 0 3px,rgba(0,0,0,.045) 3px 4px)}}main{{position:relative;width:min(1120px,100%);margin:0 auto;padding:18px 20px 52px}}
+.site-head{{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:62px;margin-bottom:14px;border:2px solid var(--line);background:#04111f;padding:10px 14px;box-shadow:5px 5px 0 var(--shadow)}}.brand{{display:flex;align-items:center;gap:10px;color:var(--ink);font-weight:900;text-decoration:none;letter-spacing:.05em}}.brand-mark{{display:grid;place-items:center;width:34px;height:34px;border:2px solid var(--sun);background:#09213a;color:var(--sun);box-shadow:3px 3px 0 var(--shadow)}}.site-status{{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}}.status-led{{width:9px;height:9px;background:var(--sun);box-shadow:0 0 9px var(--sun);animation:blink 1.8s steps(2,end) infinite}}
+.network-strip{{--route-speed:6s;position:relative;height:112px;margin-bottom:24px;overflow:hidden;border:2px solid var(--line);background-color:#030c19;background-image:radial-gradient(circle at 12% 24%,#376b91 0 1px,transparent 2px),radial-gradient(circle at 72% 17%,#376b91 0 1px,transparent 2px),radial-gradient(circle at 89% 39%,#376b91 0 1px,transparent 2px),linear-gradient(rgba(65,139,194,.08) 1px,transparent 1px),linear-gradient(90deg,rgba(65,139,194,.08) 1px,transparent 1px);background-size:auto,auto,auto,12px 12px,12px 12px;box-shadow:5px 5px 0 var(--shadow);image-rendering:pixelated}}.network-strip:before{{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 0 49.8%,rgba(78,190,255,.09) 50%,transparent 50.2%);pointer-events:none}}.route-caption{{position:absolute;z-index:4;top:9px;left:12px;color:var(--muted);font-size:9px;letter-spacing:.12em;text-transform:uppercase}}.network-line{{position:absolute;z-index:2;top:59px;height:3px;background:repeating-linear-gradient(90deg,#24628e 0 8px,transparent 8px 13px)}}.network-line.left{{left:calc(8% + 24px);right:50%}}.network-line.right{{left:50%;right:calc(8% + 24px)}}.pixel-node{{position:absolute;z-index:4;top:47px;width:27px;height:27px;border:3px solid #3b86b6;background:#07192d;box-shadow:4px 4px 0 var(--shadow)}}.pixel-node:before{{content:"";position:absolute;inset:6px;background:#245f90}}.pixel-node:after{{position:absolute;top:33px;left:50%;transform:translateX(-50%);color:#8fc9ed;font:700 9px/1 "Courier New",monospace;letter-spacing:.06em;white-space:nowrap}}.pixel-node.n1{{left:8%;animation:nodeClient var(--route-speed) steps(2,end) infinite}}.pixel-node.n1:after{{content:"УСТРОЙСТВО"}}.pixel-node.n2{{left:calc(50% - 13px);border-color:var(--sun);animation:nodeFund var(--route-speed) steps(2,end) infinite}}.pixel-node.n2:before{{background:#3b86b6}}.pixel-node.n2:after{{content:"ФОНД"}}.pixel-node.n3{{right:8%;animation:nodeInternet var(--route-speed) steps(2,end) infinite}}.pixel-node.n3:after{{content:"ИНТЕРНЕТ"}}.route-symbol{{position:absolute;z-index:5;top:51px;width:18px;height:18px;filter:drop-shadow(2px 2px 0 #01040a)}}.route-symbol.heart{{left:calc(8% + 19px);background:var(--pink);clip-path:polygon(0 20%,20% 20%,20% 0,40% 0,50% 20%,60% 0,80% 0,80% 20%,100% 20%,100% 60%,80% 60%,80% 80%,60% 80%,60% 100%,40% 100%,40% 80%,20% 80%,20% 60%,0 60%);animation:heartRoute var(--route-speed) steps(24,end) infinite}}.route-symbol.shield{{left:calc(50% - 9px);background:var(--sun);clip-path:polygon(0 0,100% 0,100% 60%,80% 60%,80% 80%,60% 80%,60% 100%,40% 100%,40% 80%,20% 80%,20% 60%,0 60%);animation:shieldRoute var(--route-speed) steps(24,end) infinite}}
+h1{{margin:22px 0 18px;max-width:900px;color:var(--ink);font-size:clamp(34px,6vw,58px);line-height:.98;letter-spacing:-.05em;text-wrap:balance;text-shadow:4px 4px 0 #102d49}}h2{{font-size:22px;margin:24px 0 11px;color:#cdeeff}}h3{{font-size:16px;margin:18px 0 8px}}p{{line-height:1.55}}a{{color:var(--sun)}}form,.card,table{{background:var(--panel);border:2px solid var(--line);border-radius:0;padding:18px;box-shadow:6px 6px 0 var(--shadow)}}.hero{{display:grid;grid-template-columns:.78fr 1.22fr;gap:18px;align-items:stretch;margin-bottom:18px}}.status{{position:relative;min-height:210px;overflow:hidden;background:linear-gradient(135deg,#071a30,#04111f);border-color:#285e88}}.status:after{{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 0%,rgba(131,223,255,.08) 42%,transparent 64%);transform:translateX(-100%);animation:sheen 5s steps(18,end) infinite;pointer-events:none}}
+.support{{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.72fr);gap:20px;align-items:center;margin-bottom:20px;border-color:#285e88;background:linear-gradient(135deg,#071a30,#04111f)}}.support-copy b{{display:block;color:var(--sun);font-size:17px;text-transform:uppercase;letter-spacing:.04em}}.support-copy p{{margin:9px 0 0}}.fund-panel{{border-left:2px dashed #2e6996;padding-left:20px}}.fund-numbers{{display:flex;align-items:end;justify-content:space-between;gap:14px;margin-bottom:9px}}.fund-numbers strong{{color:var(--sun);font-size:24px}}.fund-numbers span{{color:var(--muted);font-size:11px;text-align:right}}.fund-progress{{height:22px;border:3px solid #bfeaff;background:#020b15;padding:3px;box-shadow:3px 3px 0 var(--shadow)}}.fund-progress span{{display:block;height:100%;background:repeating-linear-gradient(90deg,#45b8ed 0 11px,#236a9d 11px 14px);animation:load .8s steps(10,end) both}}.fund-meta{{display:flex;justify-content:space-between;gap:10px;margin:8px 0 0;color:var(--muted);font-size:11px}}.fund-actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:10px}}
+.steps,.guide-grid{{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:12px;margin:14px 0}}.step,.guide-card,.protocol-card,.metric{{background:var(--panel2);border:2px solid #24547b;border-radius:0;padding:14px;box-shadow:4px 4px 0 var(--shadow)}}.step{{min-height:126px}}.step:has(.protocol-icon){{display:grid;grid-template-columns:auto minmax(0,1fr);align-content:start;align-items:center;column-gap:10px;row-gap:9px}}.step:has(.protocol-icon) .protocol-icon{{grid-column:1;grid-row:1;margin:0}}.step:has(.protocol-icon)>b{{grid-column:2;grid-row:1;margin:0}}.step:has(.protocol-icon)>.muted{{grid-column:1/-1}}.step b,.guide-card b{{display:block;margin-bottom:6px;color:var(--sun)}}.guide{{margin:20px 0}}.guide-card .num{{display:inline-grid;place-items:center;width:28px;height:28px;border:2px solid var(--sun);background:#09213a;color:var(--sun);font-weight:700;margin-bottom:10px}}.pill{{display:inline-block;border:2px solid #3377a8;background:#09213a;color:var(--sun);padding:5px 9px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;box-shadow:2px 2px 0 var(--shadow)}}.actions{{display:flex;flex-wrap:wrap;gap:10px;align-items:center}}
+label{{display:block;color:#b7cadc;margin:12px 0 6px}}input,textarea,select{{width:100%;border:2px solid #285e88;border-radius:0;background:#020b15;color:var(--ink);padding:12px;font:inherit;outline:none;box-shadow:inset 3px 3px 0 rgba(0,0,0,.35)}}input:focus,textarea:focus,select:focus{{border-color:var(--mint);box-shadow:0 0 0 2px rgba(78,190,255,.16)}}button,.btn{{display:inline-flex;align-items:center;justify-content:center;min-height:44px;border:2px solid #9ae3ff;border-radius:0;background:#3aa7dc;color:#01101d;padding:10px 14px;font:900 13px/1.15 "Courier New",monospace;text-align:center;text-decoration:none;cursor:pointer;margin-top:12px;box-shadow:4px 4px 0 #123b5b;transition:transform .1s steps(2,end),filter .1s}}button:hover,.btn:hover{{filter:brightness(1.12);transform:translate(-1px,-1px)}}button:active,.btn:active{{transform:translate(3px,3px);box-shadow:1px 1px 0 #123b5b}}.btn.secondary,button.secondary{{background:#0b2d4c;color:var(--ink);border-color:#4b9cca;box-shadow:4px 4px 0 var(--shadow)}}.btn.good{{background:#83dfff;color:#02111e;border-color:#c9f3ff;box-shadow:4px 4px 0 #245f90}}.btn[aria-busy="true"],button[aria-busy="true"]{{opacity:.75;pointer-events:none}}.btn[aria-busy="true"]:before,button[aria-busy="true"]:before{{content:"";display:inline-block;flex:0 0 auto;width:12px;height:12px;margin-right:8px;border:2px solid currentColor;border-top-color:transparent;animation:spin .7s steps(8,end) infinite}}
 .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}}.profiles{{display:grid;grid-template-columns:1fr;gap:18px}}.profile{{display:grid;grid-template-columns:270px minmax(0,1fr);gap:18px}}.protocol-choice{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:14px 0}}.protocol-option{{position:relative;display:block;background:var(--panel2);border:2px solid var(--line);padding:14px;cursor:pointer;box-shadow:4px 4px 0 var(--shadow)}}.protocol-option input{{position:absolute;opacity:0;pointer-events:none}}.protocol-option:has(input:checked){{border-color:var(--sun);background:#09213a}}.protocol-option b{{display:block;margin:8px 0 5px}}.protocol-icon,.app-icon{{display:inline-grid;place-items:center;width:40px;height:40px;border:2px solid #3b86b6;background:#09213a;color:var(--sun);font-weight:900;box-shadow:3px 3px 0 var(--shadow)}}.app-icon{{width:48px;height:48px;font-size:20px;margin-bottom:10px}}.guide-card{{min-height:190px}}.guide-card p{{margin:8px 0 0}}.guide-card .hint{{margin-top:10px;color:#b2c7dc;font-size:13px}}.protocol-section{{margin:22px 0}}.protocol-head{{display:flex;align-items:center;gap:10px;margin-bottom:12px}}.protocol-head h2{{margin:0}}.protocol-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}}.qr-box{{display:grid;place-items:center;background:#fff;border:4px solid var(--ink);padding:12px;margin:10px 0;box-shadow:5px 5px 0 var(--shadow)}}.qr-box img{{display:block}}.profile img{{width:100%;max-width:230px}}.mini-actions{{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}}.instructions{{margin:10px 0 0;padding-left:20px;color:#b2c7dc}}.instructions li{{margin:7px 0}}.copy{{word-break:break-all;background:#020b15;border:2px solid #28587c;padding:11px;color:#dff6ff}}
-.pending-box{{border-color:var(--sun);background:#07192d;animation:rise .3s steps(5,end),pulseBorder 2s steps(2,end) infinite}}.pending-line{{display:flex;align-items:center;gap:12px}}.spinner{{flex:0 0 auto;width:22px;height:22px;border:3px solid #28587c;border-top-color:var(--sun);animation:spin .8s steps(8,end) infinite}}table{{width:100%;border-collapse:collapse;padding:0;overflow:hidden}}td,th{{padding:10px;border-bottom:2px solid #173f65;text-align:left}}th{{color:var(--sun);font-size:12px;text-transform:uppercase}}.muted{{color:var(--muted)}}.ok{{color:var(--sun)}}.bad{{color:var(--danger)}}svg{{max-width:230px;height:auto;background:white}}.admin-top{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0}}.metric b{{display:block;color:var(--sun);font-size:25px;margin-top:6px}}.admin-grid{{display:grid;grid-template-columns:.82fr 1.18fr;gap:18px;align-items:start}}.request-card{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;margin-bottom:12px}}.request-card form{{box-shadow:none;padding:0;border:0;background:transparent}}.request-actions{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}.inline-form{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}.inline-form input{{width:88px}}.table-wrap{{overflow:auto;border:2px solid var(--line)}}.table-wrap table{{border:0;box-shadow:none}}details.card summary{{cursor:pointer;font-weight:900;color:var(--sun)}}
-@keyframes spin{{to{{transform:rotate(360deg)}}}}@keyframes rise{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}@keyframes sheen{{0%,55%{{transform:translateX(-100%)}}85%,100%{{transform:translateX(100%)}}}}@keyframes pulseBorder{{0%,100%{{border-color:#2b78aa}}50%{{border-color:var(--sun)}}}}@keyframes packetOut{{0%,5%{{left:calc(8% + 7px);opacity:0}}10%{{opacity:1}}32%{{left:calc(50% - 6px)}}38%{{left:calc(50% - 6px)}}62%{{left:calc(92% - 19px);opacity:1}}68%,100%{{left:calc(92% - 19px);opacity:0}}}}@keyframes packetBack{{0%,64%{{left:calc(92% - 19px);opacity:0}}68%{{opacity:1}}82%{{left:calc(50% - 6px)}}88%{{left:calc(50% - 6px)}}98%{{left:calc(8% + 7px);opacity:1}}100%{{left:calc(8% + 7px);opacity:0}}}}@keyframes nodeClient{{0%,10%,95%,100%{{background:#123b5a;box-shadow:0 0 10px var(--sun),4px 4px 0 var(--shadow)}}11%,94%{{background:#051326;box-shadow:4px 4px 0 var(--shadow)}}}}@keyframes nodeFund{{0%,29%,43%,79%,91%,100%{{background:#051326;box-shadow:4px 4px 0 var(--shadow)}}30%,42%,80%,90%{{background:#123b5a;box-shadow:0 0 10px var(--sun),4px 4px 0 var(--shadow)}}}}@keyframes nodeInternet{{0%,59%,73%,100%{{background:#051326;box-shadow:4px 4px 0 var(--shadow)}}60%,72%{{background:#123b5a;box-shadow:0 0 10px var(--sun),4px 4px 0 var(--shadow)}}}}@keyframes blink{{50%{{opacity:.35}}}}@keyframes load{{from{{width:0}}}}.card,form,.metric,.protocol-card,.guide-card{{animation:rise .28s steps(5,end) both}}
-@media(max-width:860px){{main{{padding:12px 13px 40px;overflow:hidden}}.site-head{{min-height:56px;margin-bottom:12px;padding:9px 11px}}.site-status{{display:none}}h1{{margin-top:18px;font-size:34px}}.hero,.grid,.profile,.steps,.guide-grid,.protocol-choice,.protocol-grid,.admin-grid,.support{{grid-template-columns:1fr}}.hero,.admin-grid{{gap:13px}}.hero .status{{min-height:0}}.steps,.guide-grid{{gap:9px}}.step,.guide-card{{min-height:0}}.request-card{{grid-template-columns:1fr}}.admin-top{{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}}.fund-panel{{border-left:0;border-top:2px dashed #245f90;padding:16px 0 0}}.protocol-card,.card,form{{max-width:100%}}.copy,.protocol-card p,.request-card p{{overflow-wrap:anywhere}}.table-wrap{{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}}}}
-@media(max-width:640px){{main{{padding:10px 10px 34px}}body{{font-size:15px}}h1{{font-size:31px}}h2{{font-size:20px}}form,.card{{padding:15px;box-shadow:4px 4px 0 var(--shadow)}}.brand{{font-size:13px}}.brand-mark{{width:32px;height:32px}}.network-strip{{height:82px;margin-bottom:18px;box-shadow:4px 4px 0 var(--shadow)}}.route-caption{{display:none}}.network-line{{top:34px}}.pixel-node{{top:23px}}.pixel-node:after{{top:30px;font-size:8px;letter-spacing:0}}.data-packet{{top:28px}}.support-copy b{{font-size:15px;line-height:1.35}}.fund-numbers{{align-items:start}}.fund-numbers strong{{font-size:20px}}.fund-meta{{display:block;line-height:1.45}}.fund-meta span{{display:block;margin-top:3px}}button,.btn{{width:100%;min-height:48px;text-align:center}}.actions,.mini-actions,.fund-actions,.request-actions,.inline-form{{display:grid;grid-template-columns:1fr;width:100%;gap:8px}}.request-actions form,.inline-form form{{width:100%}}.inline-form input{{width:100%}}.protocol-head{{align-items:flex-start}}.qr-box{{padding:8px;box-shadow:3px 3px 0 var(--shadow)}}.instructions{{padding-left:18px}}details.card summary{{line-height:1.45}}}}
-@media(max-width:360px){{main{{padding-inline:8px}}.site-head{{padding-inline:8px}}.brand{{gap:7px;font-size:12px}}.network-strip{{height:78px}}.pixel-node.n1{{left:7%}}.pixel-node.n3{{right:7%}}.pixel-node.n1:after{{content:"ТЕЛЕФОН"}}.fund-numbers{{display:block}}.fund-numbers span{{display:block;margin-top:7px;text-align:left}}.admin-top{{grid-template-columns:1fr}}}}
-@media(prefers-reduced-motion:reduce){{*,*:before,*:after{{animation:none!important;transition:none!important}}.data-packet{{left:calc(50% - 6px);opacity:1}}.data-packet.response{{display:none}}}}
+.pending-box{{border-color:var(--sun);background:#071b2f;animation:rise .3s steps(5,end),pulseBorder 2s steps(2,end) infinite}}.pending-line{{display:flex;align-items:center;gap:12px}}.spinner{{flex:0 0 auto;width:22px;height:22px;border:3px solid #173f65;border-top-color:var(--sun);animation:spin .8s steps(8,end) infinite}}table{{width:100%;border-collapse:collapse;padding:0;overflow:hidden}}td,th{{padding:10px;border-bottom:2px solid #173f65;text-align:left}}th{{color:var(--sun);font-size:12px;text-transform:uppercase}}.muted{{color:var(--muted)}}.ok{{color:var(--mint)}}.bad{{color:var(--danger)}}svg{{max-width:230px;height:auto;background:white}}.admin-top{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0}}.metric b{{display:block;color:var(--sun);font-size:25px;margin-top:6px}}.donation-admin-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:18px 0}}.manual-history{{margin-top:22px;border-top:2px dashed #245f90;padding-top:4px}}.manual-entry{{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;padding:10px 0;border-bottom:1px solid #173f65}}.manual-entry b{{grid-row:1 / 3;color:var(--sun);font-size:16px}}.manual-entry span{{overflow-wrap:anywhere}}.manual-entry small{{color:var(--muted)}}.admin-grid{{display:grid;grid-template-columns:.82fr 1.18fr;gap:18px;align-items:start}}.request-card{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;margin-bottom:12px}}.request-card form{{box-shadow:none;padding:0;border:0;background:transparent}}.request-actions{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}.inline-form{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}.inline-form input{{width:88px}}.table-wrap{{overflow:auto;border:2px solid #285e88}}.table-wrap table{{border:0;box-shadow:none}}details.card summary{{cursor:pointer;font-weight:900;color:var(--sun)}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}@keyframes rise{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}@keyframes sheen{{0%,55%{{transform:translateX(-100%)}}85%,100%{{transform:translateX(100%)}}}}@keyframes pulseBorder{{0%,100%{{border-color:#2a668f}}50%{{border-color:var(--sun)}}}}@keyframes heartRoute{{0%,6%{{left:calc(8% + 19px);opacity:0}}10%{{opacity:1}}43%{{left:calc(50% - 9px);opacity:1}}48%,100%{{left:calc(50% - 9px);opacity:0}}}}@keyframes shieldRoute{{0%,48%{{left:calc(50% - 9px);opacity:0}}53%{{opacity:1}}88%{{left:calc(92% - 20px);opacity:1}}94%,100%{{left:calc(92% - 20px);opacity:0}}}}@keyframes nodeClient{{0%,11%,94%,100%{{background:#0e3658}}12%,93%{{background:#07192d}}}}@keyframes nodeFund{{0%,39%,52%,100%{{background:#07192d}}40%,51%{{background:#164b70}}}}@keyframes nodeInternet{{0%,84%,96%,100%{{background:#07192d}}85%,95%{{background:#164b70}}}}@keyframes blink{{50%{{opacity:.35}}}}@keyframes load{{from{{width:0}}}}.card,form,.metric,.protocol-card,.guide-card{{animation:rise .28s steps(5,end) both}}
+@media(max-width:860px){{main{{padding:12px 13px 40px;overflow:hidden}}.site-head{{min-height:56px;margin-bottom:12px;padding:9px 11px}}.site-status{{display:none}}h1{{margin-top:20px;font-size:38px}}.hero,.grid,.profile,.steps,.guide-grid,.protocol-choice,.protocol-grid,.admin-grid,.donation-admin-grid,.support{{grid-template-columns:1fr}}.hero,.admin-grid,.donation-admin-grid{{gap:13px}}.hero .status{{min-height:0}}.steps,.guide-grid{{gap:9px}}.step,.guide-card{{min-height:0}}.request-card{{grid-template-columns:1fr}}.admin-top{{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}}.fund-panel{{border-left:0;border-top:2px dashed var(--mint);padding:16px 0 0}}.protocol-card,.card,form{{max-width:100%}}.copy,.protocol-card p,.request-card p{{overflow-wrap:anywhere}}.table-wrap{{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}}}}
+@media(max-width:640px){{main{{padding:10px 10px 34px}}body{{font-size:15px}}h1{{font-size:34px;text-shadow:3px 3px 0 #102d49}}h2{{font-size:20px}}form,.card{{padding:15px;box-shadow:4px 4px 0 var(--shadow)}}.brand{{font-size:13px}}.brand-mark{{width:32px;height:32px}}.network-strip{{height:100px;margin-bottom:20px;box-shadow:4px 4px 0 var(--shadow)}}.route-caption{{display:none}}.network-line{{top:50px}}.pixel-node{{top:38px}}.pixel-node:after{{top:32px;font-size:8px;letter-spacing:0}}.route-symbol{{top:42px}}.support-copy b{{font-size:15px;line-height:1.35}}.fund-numbers{{align-items:start}}.fund-numbers strong{{font-size:20px}}.fund-meta{{display:block;line-height:1.45}}.fund-meta span{{display:block;margin-top:3px}}button,.btn{{width:100%;min-height:48px}}.actions,.mini-actions,.fund-actions,.request-actions,.inline-form{{display:grid;grid-template-columns:1fr;width:100%;gap:8px}}.request-actions form,.inline-form form{{width:100%}}.inline-form input{{width:100%}}.protocol-head{{align-items:flex-start}}.qr-box{{padding:8px;box-shadow:3px 3px 0 var(--shadow)}}.instructions{{padding-left:18px}}.manual-entry{{grid-template-columns:1fr}}.manual-entry b{{grid-row:auto}}details.card summary{{line-height:1.45}}}}
+@media(max-width:360px){{main{{padding-inline:8px}}.site-head{{padding-inline:8px}}.brand{{gap:7px;font-size:11px}}.network-strip{{height:92px}}.pixel-node.n1{{left:7%}}.pixel-node.n3{{right:7%}}.pixel-node.n1:after{{content:"ТЕЛЕФОН"}}.fund-numbers{{display:block}}.fund-numbers span{{display:block;margin-top:7px;text-align:left}}.admin-top{{grid-template-columns:1fr}}}}
+@media(prefers-reduced-motion:reduce){{*,*:before,*:after{{animation:none!important;transition:none!important}}.route-symbol.heart{{left:28%;opacity:1}}.route-symbol.shield{{left:70%;opacity:1}}}}
 </style></head><body><main>
-<header class="site-head"><a class="brand" href="{public_url('/')}"><span class="brand-mark">Ф</span><span>SPACE // ФОНД</span></a><span class="site-status"><i class="status-led"></i> сеть фонда активна</span></header>
-<div class="network-strip" aria-hidden="true"><span class="route-caption">поддержка → фонд → свободный интернет → доступ</span><div class="network-line"></div><i class="pixel-node n1"></i><i class="pixel-node n2"></i><i class="pixel-node n3"></i><i class="data-packet"></i><i class="data-packet response"></i></div>
+<header class="site-head"><a class="brand" href="{public_url('/')}"><span class="brand-mark">Ф</span><span>Фонд им. ИИгоря</span></a><span class="site-status"><i class="status-led"></i> сеть фонда активна</span></header>
+<div class="network-strip" aria-hidden="true"><span class="route-caption">устройство → фонд → свободный интернет</span><div class="network-line left"></div><div class="network-line right"></div><i class="pixel-node n1"></i><i class="pixel-node n2"></i><i class="pixel-node n3"></i><i class="route-symbol heart"></i><i class="route-symbol shield"></i></div>
 {body}</main><script>
 document.querySelectorAll('a.btn').forEach((link) => {{
   link.addEventListener('click', () => {{
+    link.dataset.oldText = link.textContent;
     const label = link.dataset.loading || 'Загружаю...';
     link.textContent = label;
     link.setAttribute('aria-busy', 'true');
@@ -1406,6 +1469,21 @@ document.querySelectorAll('form').forEach((form) => {{
     button.setAttribute('aria-busy', 'true');
   }});
 }});
+function resetLoadingState() {{
+  document.querySelectorAll('[aria-busy="true"]').forEach((element) => {{
+    if (element.dataset.oldText) element.textContent = element.dataset.oldText;
+    element.removeAttribute('aria-busy');
+  }});
+}}
+window.addEventListener('pageshow', resetLoadingState);
+function randomizeRouteSpeed() {{
+  const route = document.querySelector('.network-strip');
+  if (!route) return;
+  route.style.setProperty('--route-speed', (4.8 + Math.random() * 2.4).toFixed(2) + 's');
+}}
+randomizeRouteSpeed();
+const routePulse = document.querySelector('.route-symbol.heart');
+if (routePulse) routePulse.addEventListener('animationiteration', randomizeRouteSpeed);
 </script></body></html>"""
 
 
@@ -1595,6 +1673,22 @@ class Handler(BaseHTTPRequestHandler):
                         """,
                         (username, None, max_profiles, note, now(), now()),
                     )
+            self.redirect(public_url("/admin"))
+        elif path == "/admin/donation/add":
+            session = self.session()
+            if not session or session["role"] != "admin":
+                self.send_login_page("Нужен вход администратора.", 401)
+                return
+            origin = self.headers.get("origin", "")
+            if origin and origin != f"https://{HOST}":
+                self.send_html(page("Ошибка", "<h1>Недопустимый источник запроса</h1>"), 403)
+                return
+            try:
+                amount = int(params.get("amount", "0") or "0")
+                add_manual_donation(amount, params.get("note", ""), session["username"])
+            except ValueError:
+                self.send_html(page("Ошибка", "<h1>Некорректная сумма доната</h1><p>Введите целое число больше нуля.</p><p><a class='btn secondary' href='" + public_url("/admin") + "'>Вернуться</a></p>"), 400)
+                return
             self.redirect(public_url("/admin"))
         elif path == "/admin/donation":
             session = self.session()
@@ -1911,11 +2005,18 @@ async function sendAccessRequest(event) {{
 function bindLoadingLinks() {{
   document.querySelectorAll('[data-loading]').forEach((link) => {{
     link.addEventListener('click', () => {{
+      link.dataset.oldText = link.textContent;
       link.textContent = link.dataset.loading;
       link.setAttribute('aria-busy', 'true');
     }});
   }});
 }}
+window.addEventListener('pageshow', () => {{
+  document.querySelectorAll('[aria-busy="true"]').forEach((element) => {{
+    if (element.dataset.oldText) element.textContent = element.dataset.oldText;
+    element.removeAttribute('aria-busy');
+  }});
+}});
 async function boot() {{
   if (!tg || !tg.initData) {{
     renderError('Нет данных Telegram WebApp.');
@@ -2181,6 +2282,16 @@ boot();
         requests = list_pending_requests()
         pending = [r for r in requests if r["status"] == "pending"]
         donation = donation_snapshot()
+        manual_donations = list_manual_donations()
+        manual_history = "<div class='manual-history'><h3>Последние ручные донаты</h3>"
+        if manual_donations:
+            for entry in manual_donations:
+                note = html.escape(entry["note"] or "Без заметки")
+                created_by = html.escape(entry["created_by"] or "admin")
+                manual_history += f"<div class='manual-entry'><b>+{format_rubles(entry['amount'])}</b><span>{note}</span><small>@{created_by} · {html.escape(entry['created_at'])}</small></div>"
+        else:
+            manual_history += "<p class='muted'>Ручных пополнений пока не было.</p>"
+        manual_history += "</div>"
         cloudtips_status = "CloudTips-ссылка настроена" if donation["url"] else "CloudTips-ссылка будет добавлена позже"
         statistics_status = "Автоматическая статистика настроена" if DONATION_STATS_TOKEN else "Автоматическая статистика не настроена"
         body = f"""<h1>Админка Фонда</h1><p class='muted'>Вход: @{html.escape(session['username'])} · <a class='btn secondary' data-loading='Открываю кабинет...' href='{public_url('/')}'>Кабинет</a> <a class='btn secondary' data-loading='Загружаю мониторинг...' href='/monitor/'>Мониторинг</a> <a class='btn secondary' href='{public_url('/logout')}'>Выйти</a></p>
@@ -2190,18 +2301,28 @@ boot();
   <div class="metric"><span class="muted">Выдано профилей</span><b>{stats['issued']}</b></div>
   <div class="metric"><span class="muted">Всего заявок</span><b>{stats['requests']}</b></div>
 </section>
-<form method="post" action="{public_url('/admin/donation')}">
-  <h2>Сбор CloudTips</h2>
-  <p class="muted">{cloudtips_status}. {statistics_status}. Ручное значение ниже работает как аварийная корректировка текущего резерва.</p>
-  <div class="grid">
-    <label>Текущий резерв, ₽<input name="raised" type="number" min="0" max="{MAX_DONATION_RUB}" step="1" value="{donation['raised']}" required></label>
-    <label>Расход в день, ₽<input name="daily" type="number" min="1" max="{MAX_DONATION_RUB}" step="1" value="{donation['daily']}" required></label>
-    <div><label>Собрано / израсходовано</label><p><b>{format_rubles(donation['total'])}</b> / {format_rubles(donation['spent'])}</p></div>
-    <div><label>Сейчас обеспечено</label><p><b>{donation['days_text']}</b> · ближайший день на {donation['percent']}%</p></div>
-  </div>
-  <button type="submit">Обновить прогресс</button>
-  <a class="btn secondary" href="{public_url('/donate')}" target="_blank" rel="noopener noreferrer">Открыть Mini App</a>
-</form>
+<section class="donation-admin-grid">
+  <form method="post" action="{public_url('/admin/donation/add')}">
+    <span class="pill">Новое пополнение</span><h2>Добавить донат вручную</h2>
+    <p class="muted">Сумма прибавится к резерву и общему сбору, не заменяя текущее значение.</p>
+    <label>Сумма, ₽<input name="amount" type="number" min="1" max="{MAX_DONATION_RUB}" step="1" inputmode="numeric" placeholder="1000" required></label>
+    <label>Заметка<textarea name="note" rows="2" maxlength="160" placeholder="Перевод, наличные или имя донора"></textarea></label>
+    <button type="submit" data-loading="Добавляю донат...">Добавить к сбору</button>
+    {manual_history}
+  </form>
+  <form method="post" action="{public_url('/admin/donation')}">
+    <span class="pill">Настройки</span><h2>Резерв и расход</h2>
+    <p class="muted">{cloudtips_status}. {statistics_status}. Изменяйте резерв здесь только для аварийной корректировки.</p>
+    <div class="grid">
+      <label>Текущий резерв, ₽<input name="raised" type="number" min="0" max="{MAX_DONATION_RUB}" step="1" value="{donation['raised']}" required></label>
+      <label>Расход в день, ₽<input name="daily" type="number" min="1" max="{MAX_DONATION_RUB}" step="1" value="{donation['daily']}" required></label>
+      <div><label>Собрано / израсходовано</label><p><b>{format_rubles(donation['total'])}</b> / {format_rubles(donation['spent'])}</p></div>
+      <div><label>Сейчас обеспечено</label><p><b>{donation['days_text']}</b> · ближайший день на {donation['percent']}%</p></div>
+    </div>
+    <button type="submit">Сохранить настройки</button>
+    <a class="btn secondary" href="{public_url('/donate')}" target="_blank" rel="noopener noreferrer">Открыть страницу сбора</a>
+  </form>
+</section>
 <section class="admin-grid">
   <form method="post" action="{public_url('/admin/user')}"><h2>Доступ пользователя</h2><p class="muted">Добавьте username, измените лимит или временно поставьте `0`, чтобы новые профили не создавались.</p><label>Telegram username</label><input name="username" placeholder="@username" required><label>Максимум профилей</label><input name="max_profiles" type="number" min="0" max="{MAX_PROFILES_PER_USERNAME}" value="1"><p class="muted">Жесткий максимум: {MAX_PROFILES_PER_USERNAME}</p><label>Заметка</label><textarea name="note" rows="3" placeholder="Кто это, когда оплачен, что выдано"></textarea><button>Сохранить доступ</button></form>
   <div class="card"><h2>Новые заявки</h2>"""
