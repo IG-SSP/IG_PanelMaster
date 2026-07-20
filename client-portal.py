@@ -53,6 +53,7 @@ DONATION_STATS_TOKEN = os.environ.get("DONATION_STATS_TOKEN", "").strip()
 DONATION_SYNC_SECONDS = env_int("DONATION_SYNC_SECONDS", 60, 30)
 MAX_DONATION_RUB = 1_000_000_000
 CLOUDTIPS_PAYMENT_HOST = "pay.cloudtips.ru"
+TELEGRAM_PROXY_URL = "https://t.me/proxy?server=ig.indiangolf.ru&port=443&secret=8883911909b8987b1f19d4f2fbc4cba3"
 BOT_ACTION_CONTEXT = threading.local()
 DONATION_LOCK = threading.Lock()
 
@@ -433,6 +434,12 @@ def delete_session(sid):
     if sid:
         with portal_db() as db:
             db.execute("delete from sessions where sid=?", (sid,))
+
+
+def session_csrf_token(sid):
+    if not sid:
+        return ""
+    return hmac.new(sid.encode(), b"client-portal-csrf", hashlib.sha256).hexdigest()
 
 
 def create_login_nonce():
@@ -1436,21 +1443,21 @@ def page(title, body):
 :root{{--ink:#e7f3ff;--muted:#8ea9c4;--sky:#020812;--panel:#061426;--panel2:#04111f;--line:#173f65;--mint:#4ebeff;--sun:#83dfff;--pink:#ff72a5;--shadow:#01040a;--danger:#ff8da9;color-scheme:dark}}
 *{{box-sizing:border-box}}html{{background:var(--sky)}}body{{margin:0;min-height:100vh;overflow-x:hidden;background:var(--sky);color:var(--ink);font-family:"Courier New",ui-monospace,monospace;background-image:linear-gradient(rgba(63,137,196,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(63,137,196,.04) 1px,transparent 1px);background-size:16px 16px}}body:after{{content:"";position:fixed;inset:0;z-index:20;pointer-events:none;background:repeating-linear-gradient(180deg,transparent 0 3px,rgba(0,0,0,.045) 3px 4px)}}main{{position:relative;width:min(1120px,100%);margin:0 auto;padding:18px 20px 52px}}
 .site-head{{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:62px;margin-bottom:14px;border:2px solid var(--line);background:#04111f;padding:10px 14px;box-shadow:5px 5px 0 var(--shadow)}}.brand{{display:flex;align-items:center;gap:10px;color:var(--ink);font-weight:900;text-decoration:none;letter-spacing:.05em}}.brand-mark{{display:grid;place-items:center;width:34px;height:34px;border:2px solid var(--sun);background:#09213a;color:var(--sun);box-shadow:3px 3px 0 var(--shadow)}}.site-status{{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}}.status-led{{width:9px;height:9px;background:var(--sun);box-shadow:0 0 9px var(--sun);animation:blink 1.8s steps(2,end) infinite}}
-.network-strip{{--route-speed:6s;position:relative;height:112px;margin-bottom:24px;overflow:hidden;border:2px solid var(--line);background-color:#030c19;background-image:radial-gradient(circle at 12% 24%,#376b91 0 1px,transparent 2px),radial-gradient(circle at 72% 17%,#376b91 0 1px,transparent 2px),radial-gradient(circle at 89% 39%,#376b91 0 1px,transparent 2px),linear-gradient(rgba(65,139,194,.08) 1px,transparent 1px),linear-gradient(90deg,rgba(65,139,194,.08) 1px,transparent 1px);background-size:auto,auto,auto,12px 12px,12px 12px;box-shadow:5px 5px 0 var(--shadow);image-rendering:pixelated}}.network-strip:before{{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 0 49.8%,rgba(78,190,255,.09) 50%,transparent 50.2%);pointer-events:none}}.route-caption{{position:absolute;z-index:4;top:9px;left:12px;color:var(--muted);font-size:9px;letter-spacing:.12em;text-transform:uppercase}}.network-line{{position:absolute;z-index:2;top:59px;height:3px;background:repeating-linear-gradient(90deg,#24628e 0 8px,transparent 8px 13px)}}.network-line.left{{left:calc(8% + 24px);right:50%}}.network-line.right{{left:50%;right:calc(8% + 24px)}}.pixel-node{{position:absolute;z-index:4;top:47px;width:27px;height:27px;border:3px solid #3b86b6;background:#07192d;box-shadow:4px 4px 0 var(--shadow)}}.pixel-node:before{{content:"";position:absolute;inset:6px;background:#245f90}}.pixel-node:after{{position:absolute;top:33px;left:50%;transform:translateX(-50%);color:#8fc9ed;font:700 9px/1 "Courier New",monospace;letter-spacing:.06em;white-space:nowrap}}.pixel-node.n1{{left:8%;animation:nodeClient var(--route-speed) steps(2,end) infinite}}.pixel-node.n1:after{{content:"УСТРОЙСТВО"}}.pixel-node.n2{{left:calc(50% - 13px);border-color:var(--sun);animation:nodeFund var(--route-speed) steps(2,end) infinite}}.pixel-node.n2:before{{background:#3b86b6}}.pixel-node.n2:after{{content:"ФОНД"}}.pixel-node.n3{{right:8%;animation:nodeInternet var(--route-speed) steps(2,end) infinite}}.pixel-node.n3:after{{content:"ИНТЕРНЕТ"}}.route-symbol{{position:absolute;z-index:5;top:51px;width:18px;height:18px;filter:drop-shadow(2px 2px 0 #01040a)}}.route-symbol.heart{{left:calc(8% + 19px);background:var(--pink);clip-path:polygon(0 20%,20% 20%,20% 0,40% 0,50% 20%,60% 0,80% 0,80% 20%,100% 20%,100% 60%,80% 60%,80% 80%,60% 80%,60% 100%,40% 100%,40% 80%,20% 80%,20% 60%,0 60%);animation:heartRoute var(--route-speed) steps(24,end) infinite}}.route-symbol.shield{{left:calc(50% - 9px);background:var(--sun);clip-path:polygon(0 0,100% 0,100% 60%,80% 60%,80% 80%,60% 80%,60% 100%,40% 100%,40% 80%,20% 80%,20% 60%,0 60%);animation:shieldRoute var(--route-speed) steps(24,end) infinite}}
+.network-strip{{--route-y:59px;--packet-x:8;--packet-scale:.5;--packet-opacity:0;--left-glow:0;--right-glow:0;--heart-scale:1;--heart-ring:0;--fund-pulse:0;--fund-ring:0;--internet-pulse:0;--shell-width:20px;--shell-opacity:.45;--scan-x:63;--scan-opacity:0;--gate-gap:0px;position:relative;height:112px;margin-bottom:24px;overflow:hidden;border:2px solid var(--line);background-color:#030c19;background-image:radial-gradient(circle at 12% 24%,#376b91 0 1px,transparent 2px),radial-gradient(circle at 72% 17%,#376b91 0 1px,transparent 2px),radial-gradient(circle at 89% 39%,#376b91 0 1px,transparent 2px),linear-gradient(rgba(65,139,194,.08) 1px,transparent 1px),linear-gradient(90deg,rgba(65,139,194,.08) 1px,transparent 1px);background-size:auto,auto,auto,12px 12px,12px 12px;box-shadow:5px 5px 0 var(--shadow);image-rendering:pixelated}}.network-strip:before{{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 0 49.8%,rgba(78,190,255,.09) 50%,transparent 50.2%);pointer-events:none}}.route-caption{{position:absolute;z-index:8;top:9px;left:12px;color:var(--muted);font-size:9px;letter-spacing:.12em;text-transform:uppercase}}.network-line{{position:absolute;z-index:2;top:var(--route-y);height:3px;overflow:hidden;background:repeating-linear-gradient(90deg,#1b4c72 0 8px,transparent 8px 13px)}}.network-line:after{{content:"";display:block;height:100%;background:repeating-linear-gradient(90deg,#67d1ff 0 8px,transparent 8px 13px);box-shadow:0 0 8px rgba(78,190,255,.7)}}.network-line.left{{left:calc(8% + 24px);right:50%}}.network-line.left:after{{width:calc(var(--left-glow) * 100%)}}.network-line.right{{left:50%;right:calc(8% + 24px)}}.network-line.right:after{{width:calc(var(--right-glow) * 100%)}}.pixel-node{{position:absolute;z-index:7;top:calc(var(--route-y) - 12px);width:27px;height:27px;border:3px solid #3b86b6;background:#07192d;box-shadow:4px 4px 0 var(--shadow)}}.pixel-node:before{{content:"";position:absolute;inset:6px;background:#245f90}}.pixel-node:after{{position:absolute;top:33px;left:50%;transform:translateX(-50%);color:#8fc9ed;font:700 9px/1 "Courier New",monospace;letter-spacing:.06em;white-space:nowrap}}.pixel-node.n1{{left:8%;filter:brightness(calc(1 + var(--device-pulse,0) * .8))}}.pixel-node.n1:after{{content:"УСТРОЙСТВО"}}.pixel-node.n2{{left:calc(50% - 13px);border-color:var(--sun);filter:brightness(calc(1 + var(--fund-pulse) * .9));transform:scale(calc(1 + var(--fund-pulse) * .06))}}.pixel-node.n2:before{{background:#3b86b6}}.pixel-node.n2:after{{content:"ФОНД"}}.pixel-node.n3{{right:8%;filter:brightness(calc(1 + var(--internet-pulse) * .85));transform:scale(calc(1 + var(--internet-pulse) * .05))}}.pixel-node.n3:after{{content:"ИНТЕРНЕТ"}}.heart-checkpoint{{position:absolute;z-index:5;left:29%;top:calc(var(--route-y) - 9px);width:18px;height:18px;background:var(--pink);clip-path:polygon(0 20%,20% 20%,20% 0,40% 0,50% 20%,60% 0,80% 0,80% 20%,100% 20%,100% 60%,80% 60%,80% 80%,60% 80%,60% 100%,40% 100%,40% 80%,20% 80%,20% 60%,0 60%);transform:translateX(-50%) scale(var(--heart-scale));filter:drop-shadow(0 0 5px rgba(255,114,165,.65))}}.heart-checkpoint:after{{content:"";position:absolute;inset:-6px;border:2px solid rgba(255,114,165,var(--heart-ring));transform:scale(calc(1 + var(--heart-ring) * .7))}}.traffic-packet{{position:absolute;z-index:6;left:calc(var(--packet-x) * 1%);top:var(--route-y);width:10px;height:10px;background:#bcefff;box-shadow:0 0 9px #4ebeff;opacity:var(--packet-opacity);transform:translate(-50%,-50%) scale(var(--packet-scale))}}.traffic-packet:after{{content:"";position:absolute;right:7px;top:3px;width:18px;height:4px;background:linear-gradient(90deg,transparent,rgba(78,190,255,.65))}}.traffic-packet:before{{content:"";position:absolute;z-index:-1;left:50%;top:50%;width:var(--shell-width);height:22px;border:2px solid rgba(131,223,255,var(--shell-opacity));background:rgba(9,42,72,.3);transform:translate(-50%,-50%);clip-path:polygon(12% 0,88% 0,100% 22%,100% 78%,88% 100%,12% 100%,0 78%,0 22%)}}.fund-ring{{position:absolute;z-index:5;left:50%;top:var(--route-y);width:28px;height:28px;border:2px solid rgba(131,223,255,var(--fund-ring));opacity:var(--fund-ring);transform:translate(-50%,-50%) scale(calc(1 + var(--fund-ring) * 1.7))}}.scan-beam{{position:absolute;z-index:3;left:calc(var(--scan-x) * 1%);top:24px;bottom:19px;width:3px;opacity:var(--scan-opacity);background:linear-gradient(180deg,rgba(117,169,205,.55) 0 38%,transparent 38% 62%,rgba(117,169,205,.55) 62% 100%);box-shadow:0 0 7px rgba(117,169,205,.35)}}.limit-gate{{position:absolute;z-index:4;top:calc(var(--route-y) - 19px);width:4px;height:41px;background:#2a5270;opacity:.72}}.limit-gate.g1{{left:74%;transform:translateX(calc(-1 * var(--gate-gap)))}}.limit-gate.g2{{left:77%;transform:translateX(var(--gate-gap))}}
 h1{{margin:22px 0 18px;max-width:900px;color:var(--ink);font-size:clamp(34px,6vw,58px);line-height:.98;letter-spacing:-.05em;text-wrap:balance;text-shadow:4px 4px 0 #102d49}}h2{{font-size:22px;margin:24px 0 11px;color:#cdeeff}}h3{{font-size:16px;margin:18px 0 8px}}p{{line-height:1.55}}a{{color:var(--sun)}}form,.card,table{{background:var(--panel);border:2px solid var(--line);border-radius:0;padding:18px;box-shadow:6px 6px 0 var(--shadow)}}.hero{{display:grid;grid-template-columns:.78fr 1.22fr;gap:18px;align-items:stretch;margin-bottom:18px}}.status{{position:relative;min-height:210px;overflow:hidden;background:linear-gradient(135deg,#071a30,#04111f);border-color:#285e88}}.status:after{{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 0%,rgba(131,223,255,.08) 42%,transparent 64%);transform:translateX(-100%);animation:sheen 5s steps(18,end) infinite;pointer-events:none}}
 .support{{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.72fr);gap:20px;align-items:center;margin-bottom:20px;border-color:#285e88;background:linear-gradient(135deg,#071a30,#04111f)}}.support-copy b{{display:block;color:var(--sun);font-size:17px;text-transform:uppercase;letter-spacing:.04em}}.support-copy p{{margin:9px 0 0}}.fund-panel{{border-left:2px dashed #2e6996;padding-left:20px}}.fund-numbers{{display:flex;align-items:end;justify-content:space-between;gap:14px;margin-bottom:9px}}.fund-numbers strong{{color:var(--sun);font-size:24px}}.fund-numbers span{{color:var(--muted);font-size:11px;text-align:right}}.fund-progress{{height:22px;border:3px solid #bfeaff;background:#020b15;padding:3px;box-shadow:3px 3px 0 var(--shadow)}}.fund-progress span{{display:block;height:100%;background:repeating-linear-gradient(90deg,#45b8ed 0 11px,#236a9d 11px 14px);animation:load .8s steps(10,end) both}}.fund-meta{{display:flex;justify-content:space-between;gap:10px;margin:8px 0 0;color:var(--muted);font-size:11px}}.fund-actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:10px}}
 .steps,.guide-grid{{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:12px;margin:14px 0}}.step,.guide-card,.protocol-card,.metric{{background:var(--panel2);border:2px solid #24547b;border-radius:0;padding:14px;box-shadow:4px 4px 0 var(--shadow)}}.step{{min-height:126px}}.step:has(.protocol-icon){{display:grid;grid-template-columns:auto minmax(0,1fr);align-content:start;align-items:center;column-gap:10px;row-gap:9px}}.step:has(.protocol-icon) .protocol-icon{{grid-column:1;grid-row:1;margin:0}}.step:has(.protocol-icon)>b{{grid-column:2;grid-row:1;margin:0}}.step:has(.protocol-icon)>.muted{{grid-column:1/-1}}.step b,.guide-card b{{display:block;margin-bottom:6px;color:var(--sun)}}.guide{{margin:20px 0}}.guide-card .num{{display:inline-grid;place-items:center;width:28px;height:28px;border:2px solid var(--sun);background:#09213a;color:var(--sun);font-weight:700;margin-bottom:10px}}.pill{{display:inline-block;border:2px solid #3377a8;background:#09213a;color:var(--sun);padding:5px 9px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;box-shadow:2px 2px 0 var(--shadow)}}.actions{{display:flex;flex-wrap:wrap;gap:10px;align-items:center}}
 label{{display:block;color:#b7cadc;margin:12px 0 6px}}input,textarea,select{{width:100%;border:2px solid #285e88;border-radius:0;background:#020b15;color:var(--ink);padding:12px;font:inherit;outline:none;box-shadow:inset 3px 3px 0 rgba(0,0,0,.35)}}input:focus,textarea:focus,select:focus{{border-color:var(--mint);box-shadow:0 0 0 2px rgba(78,190,255,.16)}}button,.btn{{display:inline-flex;align-items:center;justify-content:center;min-height:44px;border:2px solid #9ae3ff;border-radius:0;background:#3aa7dc;color:#01101d;padding:10px 14px;font:900 13px/1.15 "Courier New",monospace;text-align:center;text-decoration:none;cursor:pointer;margin-top:12px;box-shadow:4px 4px 0 #123b5b;transition:transform .1s steps(2,end),filter .1s}}button:hover,.btn:hover{{filter:brightness(1.12);transform:translate(-1px,-1px)}}button:active,.btn:active{{transform:translate(3px,3px);box-shadow:1px 1px 0 #123b5b}}.btn.secondary,button.secondary{{background:#0b2d4c;color:var(--ink);border-color:#4b9cca;box-shadow:4px 4px 0 var(--shadow)}}.btn.good{{background:#83dfff;color:#02111e;border-color:#c9f3ff;box-shadow:4px 4px 0 #245f90}}.btn[aria-busy="true"],button[aria-busy="true"]{{opacity:.75;pointer-events:none}}.btn[aria-busy="true"]:before,button[aria-busy="true"]:before{{content:"";display:inline-block;flex:0 0 auto;width:12px;height:12px;margin-right:8px;border:2px solid currentColor;border-top-color:transparent;animation:spin .7s steps(8,end) infinite}}
 .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}}.profiles{{display:grid;grid-template-columns:1fr;gap:18px}}.profile{{display:grid;grid-template-columns:270px minmax(0,1fr);gap:18px}}.protocol-choice{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:14px 0}}.protocol-option{{position:relative;display:block;background:var(--panel2);border:2px solid var(--line);padding:14px;cursor:pointer;box-shadow:4px 4px 0 var(--shadow)}}.protocol-option input{{position:absolute;opacity:0;pointer-events:none}}.protocol-option:has(input:checked){{border-color:var(--sun);background:#09213a}}.protocol-option b{{display:block;margin:8px 0 5px}}.protocol-icon,.app-icon{{display:inline-grid;place-items:center;width:40px;height:40px;border:2px solid #3b86b6;background:#09213a;color:var(--sun);font-weight:900;box-shadow:3px 3px 0 var(--shadow)}}.app-icon{{width:48px;height:48px;font-size:20px;margin-bottom:10px}}.guide-card{{min-height:190px}}.guide-card p{{margin:8px 0 0}}.guide-card .hint{{margin-top:10px;color:#b2c7dc;font-size:13px}}.protocol-section{{margin:22px 0}}.protocol-head{{display:flex;align-items:center;gap:10px;margin-bottom:12px}}.protocol-head h2{{margin:0}}.protocol-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}}.qr-box{{display:grid;place-items:center;background:#fff;border:4px solid var(--ink);padding:12px;margin:10px 0;box-shadow:5px 5px 0 var(--shadow)}}.qr-box img{{display:block}}.profile img{{width:100%;max-width:230px}}.mini-actions{{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}}.instructions{{margin:10px 0 0;padding-left:20px;color:#b2c7dc}}.instructions li{{margin:7px 0}}.copy{{word-break:break-all;background:#020b15;border:2px solid #28587c;padding:11px;color:#dff6ff}}
 .pending-box{{border-color:var(--sun);background:#071b2f;animation:rise .3s steps(5,end),pulseBorder 2s steps(2,end) infinite}}.pending-line{{display:flex;align-items:center;gap:12px}}.spinner{{flex:0 0 auto;width:22px;height:22px;border:3px solid #173f65;border-top-color:var(--sun);animation:spin .8s steps(8,end) infinite}}table{{width:100%;border-collapse:collapse;padding:0;overflow:hidden}}td,th{{padding:10px;border-bottom:2px solid #173f65;text-align:left}}th{{color:var(--sun);font-size:12px;text-transform:uppercase}}.muted{{color:var(--muted)}}.ok{{color:var(--mint)}}.bad{{color:var(--danger)}}svg{{max-width:230px;height:auto;background:white}}.admin-top{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0}}.metric b{{display:block;color:var(--sun);font-size:25px;margin-top:6px}}.donation-admin-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:18px 0}}.manual-history{{margin-top:22px;border-top:2px dashed #245f90;padding-top:4px}}.manual-entry{{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;padding:10px 0;border-bottom:1px solid #173f65}}.manual-entry b{{grid-row:1 / 3;color:var(--sun);font-size:16px}}.manual-entry span{{overflow-wrap:anywhere}}.manual-entry small{{color:var(--muted)}}.admin-grid{{display:grid;grid-template-columns:.82fr 1.18fr;gap:18px;align-items:start}}.request-card{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;margin-bottom:12px}}.request-card form{{box-shadow:none;padding:0;border:0;background:transparent}}.request-actions{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}.inline-form{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}.inline-form input{{width:88px}}.table-wrap{{overflow:auto;border:2px solid #285e88}}.table-wrap table{{border:0;box-shadow:none}}details.card summary{{cursor:pointer;font-weight:900;color:var(--sun)}}
-@keyframes spin{{to{{transform:rotate(360deg)}}}}@keyframes rise{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}@keyframes sheen{{0%,55%{{transform:translateX(-100%)}}85%,100%{{transform:translateX(100%)}}}}@keyframes pulseBorder{{0%,100%{{border-color:#2a668f}}50%{{border-color:var(--sun)}}}}@keyframes heartRoute{{0%,6%{{left:calc(8% + 19px);opacity:0}}10%{{opacity:1}}43%{{left:calc(50% - 9px);opacity:1}}48%,100%{{left:calc(50% - 9px);opacity:0}}}}@keyframes shieldRoute{{0%,48%{{left:calc(50% - 9px);opacity:0}}53%{{opacity:1}}88%{{left:calc(92% - 20px);opacity:1}}94%,100%{{left:calc(92% - 20px);opacity:0}}}}@keyframes nodeClient{{0%,11%,94%,100%{{background:#0e3658}}12%,93%{{background:#07192d}}}}@keyframes nodeFund{{0%,39%,52%,100%{{background:#07192d}}40%,51%{{background:#164b70}}}}@keyframes nodeInternet{{0%,84%,96%,100%{{background:#07192d}}85%,95%{{background:#164b70}}}}@keyframes blink{{50%{{opacity:.35}}}}@keyframes load{{from{{width:0}}}}.card,form,.metric,.protocol-card,.guide-card{{animation:rise .28s steps(5,end) both}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}@keyframes rise{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}@keyframes sheen{{0%,55%{{transform:translateX(-100%)}}85%,100%{{transform:translateX(100%)}}}}@keyframes pulseBorder{{0%,100%{{border-color:#2a668f}}50%{{border-color:var(--sun)}}}}@keyframes blink{{50%{{opacity:.35}}}}@keyframes load{{from{{width:0}}}}.card,form,.metric,.protocol-card,.guide-card{{animation:rise .28s steps(5,end) both}}
 @media(max-width:860px){{main{{padding:12px 13px 40px;overflow:hidden}}.site-head{{min-height:56px;margin-bottom:12px;padding:9px 11px}}.site-status{{display:none}}h1{{margin-top:20px;font-size:38px}}.hero,.grid,.profile,.steps,.guide-grid,.protocol-choice,.protocol-grid,.admin-grid,.donation-admin-grid,.support{{grid-template-columns:1fr}}.hero,.admin-grid,.donation-admin-grid{{gap:13px}}.hero .status{{min-height:0}}.steps,.guide-grid{{gap:9px}}.step,.guide-card{{min-height:0}}.request-card{{grid-template-columns:1fr}}.admin-top{{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}}.fund-panel{{border-left:0;border-top:2px dashed var(--mint);padding:16px 0 0}}.protocol-card,.card,form{{max-width:100%}}.copy,.protocol-card p,.request-card p{{overflow-wrap:anywhere}}.table-wrap{{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}}}}
-@media(max-width:640px){{main{{padding:10px 10px 34px}}body{{font-size:15px}}h1{{font-size:34px;text-shadow:3px 3px 0 #102d49}}h2{{font-size:20px}}form,.card{{padding:15px;box-shadow:4px 4px 0 var(--shadow)}}.brand{{font-size:13px}}.brand-mark{{width:32px;height:32px}}.network-strip{{height:100px;margin-bottom:20px;box-shadow:4px 4px 0 var(--shadow)}}.route-caption{{display:none}}.network-line{{top:50px}}.pixel-node{{top:38px}}.pixel-node:after{{top:32px;font-size:8px;letter-spacing:0}}.route-symbol{{top:42px}}.support-copy b{{font-size:15px;line-height:1.35}}.fund-numbers{{align-items:start}}.fund-numbers strong{{font-size:20px}}.fund-meta{{display:block;line-height:1.45}}.fund-meta span{{display:block;margin-top:3px}}button,.btn{{width:100%;min-height:48px}}.actions,.mini-actions,.fund-actions,.request-actions,.inline-form{{display:grid;grid-template-columns:1fr;width:100%;gap:8px}}.request-actions form,.inline-form form{{width:100%}}.inline-form input{{width:100%}}.protocol-head{{align-items:flex-start}}.qr-box{{padding:8px;box-shadow:3px 3px 0 var(--shadow)}}.instructions{{padding-left:18px}}.manual-entry{{grid-template-columns:1fr}}.manual-entry b{{grid-row:auto}}details.card summary{{line-height:1.45}}}}
+@media(max-width:640px){{main{{padding:10px 10px 34px}}body{{font-size:15px}}h1{{font-size:34px;text-shadow:3px 3px 0 #102d49}}h2{{font-size:20px}}form,.card{{padding:15px;box-shadow:4px 4px 0 var(--shadow)}}.brand{{font-size:13px}}.brand-mark{{width:32px;height:32px}}.network-strip{{--route-y:50px;height:100px;margin-bottom:20px;box-shadow:4px 4px 0 var(--shadow)}}.route-caption{{display:none}}.pixel-node:after{{top:32px;font-size:8px;letter-spacing:0}}.support-copy b{{font-size:15px;line-height:1.35}}.fund-numbers{{align-items:start}}.fund-numbers strong{{font-size:20px}}.fund-meta{{display:block;line-height:1.45}}.fund-meta span{{display:block;margin-top:3px}}button,.btn{{width:100%;min-height:48px}}.actions,.mini-actions,.fund-actions,.request-actions,.inline-form{{display:grid;grid-template-columns:1fr;width:100%;gap:8px}}.request-actions form,.inline-form form{{width:100%}}.inline-form input{{width:100%}}.protocol-head{{align-items:flex-start}}.qr-box{{padding:8px;box-shadow:3px 3px 0 var(--shadow)}}.instructions{{padding-left:18px}}.manual-entry{{grid-template-columns:1fr}}.manual-entry b{{grid-row:auto}}details.card summary{{line-height:1.45}}}}
 @media(max-width:360px){{main{{padding-inline:8px}}.site-head{{padding-inline:8px}}.brand{{gap:7px;font-size:11px}}.network-strip{{height:92px}}.pixel-node.n1{{left:7%}}.pixel-node.n3{{right:7%}}.pixel-node.n1:after{{content:"ТЕЛЕФОН"}}.fund-numbers{{display:block}}.fund-numbers span{{display:block;margin-top:7px;text-align:left}}.admin-top{{grid-template-columns:1fr}}}}
-@media(prefers-reduced-motion:reduce){{*,*:before,*:after{{animation:none!important;transition:none!important}}.route-symbol.heart{{left:28%;opacity:1}}.route-symbol.shield{{left:70%;opacity:1}}}}
+@media(prefers-reduced-motion:reduce){{*,*:before,*:after{{animation:none!important;transition:none!important}}.network-strip{{--packet-x:67;--packet-scale:1;--packet-opacity:1;--left-glow:1;--right-glow:.45;--shell-width:38px;--shell-opacity:.8}}.scan-beam{{display:none}}}}
 </style></head><body><main>
 <header class="site-head"><a class="brand" href="{public_url('/')}"><span class="brand-mark">Ф</span><span>Фонд им. ИИгоря</span></a><span class="site-status"><i class="status-led"></i> сеть фонда активна</span></header>
-<div class="network-strip" aria-hidden="true"><span class="route-caption">устройство → фонд → свободный интернет</span><div class="network-line left"></div><div class="network-line right"></div><i class="pixel-node n1"></i><i class="pixel-node n2"></i><i class="pixel-node n3"></i><i class="route-symbol heart"></i><i class="route-symbol shield"></i></div>
+<div class="network-strip" data-state="idle" aria-hidden="true"><span class="route-caption">устройство → фонд → защищённый интернет</span><div class="network-line left"></div><div class="network-line right"></div><i class="heart-checkpoint"></i><i class="limit-gate g1"></i><i class="limit-gate g2"></i><i class="scan-beam"></i><i class="fund-ring"></i><i class="pixel-node n1"></i><i class="pixel-node n2"></i><i class="pixel-node n3"></i><i class="traffic-packet"></i></div>
 {body}</main><script>
 document.querySelectorAll('a.btn').forEach((link) => {{
   link.addEventListener('click', () => {{
@@ -1476,14 +1483,79 @@ function resetLoadingState() {{
   }});
 }}
 window.addEventListener('pageshow', resetLoadingState);
-function randomizeRouteSpeed() {{
-  const route = document.querySelector('.network-strip');
-  if (!route) return;
-  route.style.setProperty('--route-speed', (4.8 + Math.random() * 2.4).toFixed(2) + 's');
+const routeScene = document.querySelector('.network-strip');
+if (routeScene && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {{
+  const clamp01 = (value) => Math.max(0, Math.min(1, value));
+  const smooth = (value) => {{ const p = clamp01(value); return p * p * (3 - 2 * p); }};
+  const pulse = (value, center, radius) => Math.max(0, 1 - Math.abs(value - center) / radius);
+  const setRoute = (values) => Object.entries(values).forEach(([name, value]) => routeScene.style.setProperty('--' + name, value));
+  const quiet = {{'device-pulse':0,'fund-pulse':0,'fund-ring':0,'internet-pulse':0,'heart-ring':0,'scan-opacity':0,'gate-gap':'0px'}};
+  const stages = [
+    {{name:'IDLE',ratio:.08,update(p){{setRoute({{...quiet,'packet-x':8,'packet-opacity':smooth(p),'packet-scale':.5+.5*smooth(p),'left-glow':0,'right-glow':0,'heart-scale':1,'shell-width':'20px','shell-opacity':.42,'device-pulse':Math.sin(Math.PI*p)}})}}}},
+    {{name:'CLIENT_TO_FUND',ratio:.26,update(p){{
+      let heartScale=1;
+      if(p<.4)heartScale=1-.12*(p/.4);else if(p<.62)heartScale=.88+.38*((p-.4)/.22);else heartScale=1.26-.26*clamp01((p-.62)/.28);
+      setRoute({{...quiet,'packet-x':8+42*p,'packet-opacity':1,'packet-scale':1,'left-glow':p,'right-glow':0,'heart-scale':heartScale,'heart-ring':pulse(p,.58,.2),'shell-width':'20px','shell-opacity':.5,'device-pulse':Math.max(0,1-p*4)}});
+    }}}},
+    {{name:'FUND_PROCESSING',ratio:.10,update(p){{
+      const packetOpacity=p<.3?1-p/.3:(p<.65?0:(p-.65)/.35);
+      const fundPulse=Math.sin(Math.PI*p);
+      setRoute({{...quiet,'packet-x':50,'packet-opacity':packetOpacity,'packet-scale':1,'left-glow':1-.2*p,'right-glow':0,'heart-scale':1,'shell-width':(20+18*smooth(p))+'px','shell-opacity':.45+.4*smooth(p),'fund-pulse':fundPulse,'fund-ring':fundPulse}});
+    }}}},
+    {{name:'FUND_TO_INTERNET',ratio:.38,update(p){{
+      const scanPhase=clamp01((p-.2)/.48);const scanActive=p>.2&&p<.72?Math.sin(Math.PI*scanPhase):0;const scanX=58+28*scanPhase;const packetX=50+42*p;const scanSafe=Math.abs(scanX-packetX)<4?.16:.58;
+      setRoute({{...quiet,'packet-x':packetX,'packet-opacity':1,'packet-scale':1,'left-glow':Math.max(.35,1-p),'right-glow':p,'heart-scale':1,'shell-width':'38px','shell-opacity':.82,'scan-x':scanX,'scan-opacity':scanActive*scanSafe,'gate-gap':(12*pulse(p,.61,.16))+'px'}});
+    }}}},
+    {{name:'FINISH',ratio:.18,update(p){{
+      const arrival=pulse(p,.18,.2);
+      setRoute({{...quiet,'packet-x':92,'packet-opacity':1-smooth(p/.48),'packet-scale':1,'left-glow':0,'right-glow':1-smooth(p),'heart-scale':1,'shell-width':'38px','shell-opacity':.82,'internet-pulse':arrival}});
+    }}}}
+  ];
+  let cycleDuration=4500+Math.random()*1000;
+  let stateIndex=0;
+  let stateStarted=performance.now();
+  function routeFrame(now) {{
+    const stage=stages[stateIndex];
+    const duration=cycleDuration*stage.ratio;
+    const progress=clamp01((now-stateStarted)/duration);
+    routeScene.dataset.state=stage.name;
+    stage.update(progress);
+    if(progress>=1){{
+      stateIndex=(stateIndex+1)%stages.length;
+      stateStarted=now;
+      if(stateIndex===0)cycleDuration=4500+Math.random()*1000;
+    }}
+    window.requestAnimationFrame(routeFrame);
+  }}
+  window.requestAnimationFrame(routeFrame);
 }}
-randomizeRouteSpeed();
-const routePulse = document.querySelector('.route-symbol.heart');
-if (routePulse) routePulse.addEventListener('animationiteration', randomizeRouteSpeed);
+document.querySelectorAll('[data-copy-text]').forEach((button) => {{
+  button.addEventListener('click', async () => {{
+    const value = button.dataset.copyText || '';
+    const oldText = button.textContent;
+    try {{
+      if (navigator.clipboard && window.isSecureContext) {{
+        await navigator.clipboard.writeText(value);
+      }} else {{
+        const field = document.createElement('textarea');
+        field.value = value;
+        field.setAttribute('readonly', '');
+        field.style.position = 'fixed';
+        field.style.opacity = '0';
+        document.body.appendChild(field);
+        field.select();
+        if (!document.execCommand('copy')) throw new Error('copy failed');
+        field.remove();
+      }}
+      button.textContent = 'Ссылка скопирована ✓';
+      const status = document.getElementById(button.dataset.copyStatus || '');
+      if (status) status.textContent = 'Готово. Отправьте ссылку себе в Telegram и нажмите на неё.';
+    }} catch (_error) {{
+      button.textContent = 'Не удалось скопировать';
+    }}
+    setTimeout(() => {{ button.textContent = oldText; }}, 2600);
+  }});
+}});
 </script></body></html>"""
 
 
@@ -1531,6 +1603,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def session(self):
         return get_session(self.cookie_sid())
+
+    def valid_csrf(self, params):
+        supplied = params.get("csrf", "")
+        expected = session_csrf_token(self.cookie_sid())
+        return bool(supplied and expected and hmac.compare_digest(supplied, expected))
 
     def set_session_cookie(self, sid):
         self.send_header("set-cookie", f"vpn_session={sid}; Max-Age={SESSION_TTL}; Path=/; HttpOnly; Secure; SameSite=Lax")
@@ -1679,9 +1756,8 @@ class Handler(BaseHTTPRequestHandler):
             if not session or session["role"] != "admin":
                 self.send_login_page("Нужен вход администратора.", 401)
                 return
-            origin = self.headers.get("origin", "")
-            if origin and origin != f"https://{HOST}":
-                self.send_html(page("Ошибка", "<h1>Недопустимый источник запроса</h1>"), 403)
+            if not self.valid_csrf(params):
+                self.send_html(page("Ошибка", "<h1>Сессия формы устарела</h1><p>Обновите страницу админки и повторите попытку.</p>"), 403)
                 return
             try:
                 amount = int(params.get("amount", "0") or "0")
@@ -1695,9 +1771,8 @@ class Handler(BaseHTTPRequestHandler):
             if not session or session["role"] != "admin":
                 self.send_login_page("Нужен вход администратора.", 401)
                 return
-            origin = self.headers.get("origin", "")
-            if origin and origin != f"https://{HOST}":
-                self.send_html(page("Ошибка", "<h1>Недопустимый источник запроса</h1>"), 403)
+            if not self.valid_csrf(params):
+                self.send_html(page("Ошибка", "<h1>Сессия формы устарела</h1><p>Обновите страницу админки и повторите попытку.</p>"), 403)
                 return
             try:
                 raised = max(0, min(int(params.get("raised", "0") or "0"), MAX_DONATION_RUB))
@@ -1871,7 +1946,7 @@ main{{width:min(720px,100%);margin:0 auto;padding:calc(18px + env(safe-area-inse
 .amount{{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:22px}}.amount strong{{font-size:clamp(27px,8vw,40px);line-height:1}}.amount span{{color:var(--muted);font-size:13px;text-align:right}}
 .progress{{height:22px;margin:13px 0 8px;border:4px solid var(--ink);background:#07171b;padding:3px}}.progress span{{display:block;width:{snapshot['percent']}%;height:100%;background:repeating-linear-gradient(90deg,var(--sun) 0 11px,#ad773d 11px 14px);animation:load .7s steps(7,end) both}}@keyframes load{{from{{width:0}}}}
 .progress-label{{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:10px;white-space:nowrap}}.metrics{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0}}.metric{{min-height:94px;border:2px solid var(--line);background:#04111f;padding:12px}}.metric b{{display:block;margin-bottom:6px;color:var(--sun);font-size:20px}}.metric span{{color:var(--muted);font:13px/1.35 system-ui,sans-serif}}
-.loop{{border-left:4px solid var(--mint);margin:18px 0;padding:3px 0 3px 13px;font:15px/1.5 system-ui,sans-serif}}.donate-cta{{display:flex;align-items:center;justify-content:space-between;min-height:56px;margin-top:16px;padding:14px 16px;background:var(--mint);color:#04182b;border:2px solid #bcecff;box-shadow:5px 5px 0 #020916;font-weight:900;text-decoration:none}}.donate-cta:active{{transform:translate(3px,3px);box-shadow:2px 2px 0 #020916}}.donate-cta:focus-visible{{outline:3px solid var(--sun);outline-offset:4px}}.donate-cta.disabled{{background:#304d6d;color:#a9bdd5;border-color:#4a6988;box-shadow:none}}.hint{{margin:13px 2px;color:var(--muted);font:12px/1.45 system-ui,sans-serif}}
+.loop{{border-left:4px solid var(--mint);margin:18px 0;padding:3px 0 3px 13px;font:15px/1.5 system-ui,sans-serif}}.donate-cta{{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:56px;margin-top:16px;padding:14px 16px;background:var(--mint);color:#04182b;border:2px solid #bcecff;box-shadow:5px 5px 0 #020916;font:900 14px/1.2 "Courier New",monospace;text-align:left;text-decoration:none;cursor:pointer}}.donate-cta:active{{transform:translate(3px,3px);box-shadow:2px 2px 0 #020916}}.donate-cta:focus-visible{{outline:3px solid var(--sun);outline-offset:4px}}.donate-cta.disabled,.donate-cta[aria-busy="true"]{{background:#304d6d;color:#a9bdd5;border-color:#4a6988;box-shadow:none;pointer-events:none}}.hint{{margin:13px 2px;color:var(--muted);font:12px/1.45 system-ui,sans-serif}}.cabinet-card{{margin-top:22px;border:2px solid var(--line);background:#04111f;padding:18px;box-shadow:6px 6px 0 var(--shadow)}}.cabinet-card h2{{margin-top:7px}}.cabinet-cta{{background:#0b2d4c;color:var(--ink);border-color:#4b9cca}}.cabinet-status{{min-height:18px;margin-bottom:0}}
 @media(min-width:560px){{.pixel-card{{padding:24px}}.pixel-scene{{height:290px;margin:-24px -24px 22px}}}}@media(max-width:390px){{.metrics{{grid-template-columns:1fr}}.pixel-scene{{height:220px}}.progress-label{{font-size:9px;letter-spacing:-.03em}}}}
 @media(prefers-reduced-motion:reduce){{*,*:before,*:after{{animation:none!important;transition:none!important}}}}
 </style></head><body><main>
@@ -1904,8 +1979,40 @@ main{{width:min(720px,100%);margin:0 auto;padding:calc(18px + env(safe-area-inse
   <div class="metrics"><div class="metric"><b>{total}</b><span>Собрано с 20 июля</span></div><div class="metric"><b>{spent}</b><span>Израсходовано с 20 июля</span></div><div class="metric"><b>≈ {daily} / день</b><span>нужно для снабжения ресурсов</span></div><div class="metric"><b>{snapshot['days_text']}</b><span>работы уже обеспечено текущим резервом</span></div></div>
   <p class="loop">Фонд поддерживает доступ. Мы поддерживаем фонд. Так свободный интернет остаётся доступным для всех.</p>
   {cta}<p class="hint">{hint}</p>
+</section>
+<section class="cabinet-card" aria-labelledby="cabinet-title">
+  <p class="kicker">Личный кабинет</p><h2 id="cabinet-title">Доступы и профили</h2>
+  <p class="explain">Откройте полный кабинет Фонда: заявки, профили, QR-коды и инструкции. Telegram подтвердит вход автоматически — повторно вводить username не нужно.</p>
+  <button id="cabinetCta" class="donate-cta cabinet-cta" type="button">Перейти в основной кабинет <span aria-hidden="true">→</span></button>
+  <p id="cabinetStatus" class="hint cabinet-status" role="status"></p>
 </section></main>
-<script>const tg=window.Telegram&&window.Telegram.WebApp;if(tg){{tg.ready();tg.expand();if(tg.MainButton)tg.MainButton.hide()}}const cta=document.getElementById('donateCta');if(cta)cta.addEventListener('click',function(event){{if(tg&&tg.openLink){{event.preventDefault();tg.openLink(this.href)}}}});</script>
+<script>
+const tg=window.Telegram&&window.Telegram.WebApp;
+if(tg){{tg.ready();tg.expand();if(tg.MainButton)tg.MainButton.hide()}}
+const cta=document.getElementById('donateCta');
+if(cta)cta.addEventListener('click',function(event){{if(tg&&tg.openLink){{event.preventDefault();tg.openLink(this.href)}}}});
+const cabinetCta=document.getElementById('cabinetCta');
+const cabinetStatus=document.getElementById('cabinetStatus');
+if(cabinetCta)cabinetCta.addEventListener('click',async function(){{
+  if(!tg||!tg.initData){{window.location.assign('{public_url('/')}');return}}
+  cabinetCta.dataset.oldText=cabinetCta.textContent;
+  cabinetCta.textContent='Подтверждаю вход...';
+  cabinetCta.setAttribute('aria-busy','true');
+  cabinetStatus.textContent='Получаю подтверждённый username из Telegram.';
+  try{{
+    const body=new URLSearchParams();body.set('init_data',tg.initData);
+    const response=await fetch('{public_url('/app/auth')}',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},credentials:'same-origin',body}});
+    const data=await response.json().catch(()=>null);
+    if(!response.ok||!data||!data.ok)throw new Error(data&&data.error?data.error:'Не удалось подтвердить вход.');
+    if(data.need_username)throw new Error('Telegram не передал username. Добавьте username в настройках Telegram и откройте Mini App снова.');
+    window.location.assign('{public_url('/')}');
+  }}catch(error){{
+    cabinetCta.textContent=cabinetCta.dataset.oldText||'Перейти в основной кабинет →';
+    cabinetCta.removeAttribute('aria-busy');
+    cabinetStatus.textContent=error.message||'Не удалось открыть кабинет.';
+  }}
+}});
+</script>
 </body></html>'''
 
     def mini_app_page(self):
@@ -2193,14 +2300,15 @@ boot();
         username = session["username"]
         admin_links = ""
         if session["role"] == "admin":
-            admin_links = f"""<div class="actions"><a class="btn secondary" data-loading="Открываю админку..." href="{public_url('/admin')}">Админка</a><a class="btn secondary" data-loading="Загружаю мониторинг..." href="/monitor/">Мониторинг</a></div>"""
+            admin_links = f"""<a class="btn secondary" data-loading="Открываю админку..." href="{public_url('/admin')}">Админка</a><a class="btn secondary" data-loading="Загружаю мониторинг..." href="/monitor/">Мониторинг</a>"""
+        proxy_url = html.escape(TELEGRAM_PROXY_URL, quote=True)
         content = f"""<h1>Доступы Фонда</h1>{support_block()}
 <section class="hero">
   <div class="card status">
     <span class="pill">Личный кабинет</span>
     <h2>Все идет по плану</h2>
     <p class="muted">Вы вошли как @{html.escape(username)}. Слева собран статус доступа, справа - что именно выдать клиенту и как он будет подключаться.</p>
-    {admin_links}
+    <div class="actions"><a class="btn secondary" href="#proxy">Прокси</a>{admin_links}</div>
   </div>
   <div class="card">
     <h2>Что делает клиент</h2>
@@ -2211,6 +2319,12 @@ boot();
     </div>
     <p><a class='btn secondary' href='{public_url('/logout')}'>Выйти</a></p>
   </div>
+</section>
+<section id="proxy" class="card">
+  <div class="protocol-head"><span class="protocol-icon">TG</span><h2>Прокси</h2></div>
+  <p>Быстрое подключение прокси в Telegram.</p>
+  <div class="actions"><a class="btn" href="{proxy_url}" target="_blank" rel="noopener noreferrer">Подключить прокси</a><button class="secondary" type="button" data-copy-text="{proxy_url}" data-copy-status="proxyCopyStatus">Если не открывается — нажми сюда</button></div>
+  <p id="proxyCopyStatus" class="muted" role="status">Если кнопка подключения не открывается, нажмите кнопку копирования. Затем отправьте ссылку себе в сообщения Telegram и нажмите на неё, даже если сообщение не отправится. После этого подключитесь.</p>
 </section>"""
         user = get_user_for_session(session)
         if not user:
@@ -2282,6 +2396,7 @@ boot();
         requests = list_pending_requests()
         pending = [r for r in requests if r["status"] == "pending"]
         donation = donation_snapshot()
+        donation_csrf = session_csrf_token(self.cookie_sid())
         manual_donations = list_manual_donations()
         manual_history = "<div class='manual-history'><h3>Последние ручные донаты</h3>"
         if manual_donations:
@@ -2303,6 +2418,7 @@ boot();
 </section>
 <section class="donation-admin-grid">
   <form method="post" action="{public_url('/admin/donation/add')}">
+    <input type="hidden" name="csrf" value="{donation_csrf}">
     <span class="pill">Новое пополнение</span><h2>Добавить донат вручную</h2>
     <p class="muted">Сумма прибавится к резерву и общему сбору, не заменяя текущее значение.</p>
     <label>Сумма, ₽<input name="amount" type="number" min="1" max="{MAX_DONATION_RUB}" step="1" inputmode="numeric" placeholder="1000" required></label>
@@ -2311,6 +2427,7 @@ boot();
     {manual_history}
   </form>
   <form method="post" action="{public_url('/admin/donation')}">
+    <input type="hidden" name="csrf" value="{donation_csrf}">
     <span class="pill">Настройки</span><h2>Резерв и расход</h2>
     <p class="muted">{cloudtips_status}. {statistics_status}. Изменяйте резерв здесь только для аварийной корректировки.</p>
     <div class="grid">
