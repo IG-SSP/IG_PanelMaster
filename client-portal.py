@@ -16,6 +16,15 @@ from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+
+def env_int(name, default, minimum=0):
+    try:
+        value = int(os.environ.get(name, str(default)) or str(default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
 WG_DB = "/var/lib/docker/volumes/wg-easy_etc_wireguard/_data/wg-easy.db"
 PORTAL_DB = "/opt/client-portal/portal.db"
 HOST = "space.indiangolf.ru"
@@ -23,6 +32,8 @@ WG_PORT = 51820
 PUBLIC_PREFIX = os.environ.get("PUBLIC_PREFIX", "/portal").rstrip("/")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "")
+BOT_POLLING_ENABLED = os.environ.get("BOT_POLLING_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+BOT_RELAY_SECRET = os.environ.get("BOT_RELAY_SECRET", "")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").replace(",", " ").split() if x.isdigit()}
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 SESSION_TTL = SESSION_DAYS * 86400
@@ -35,6 +46,15 @@ HAPP_SOURCE_B64_URL = os.environ.get(
     "HAPP_SOURCE_B64_URL",
     "https://space.indiangolf.ru/happ/196dcc3a9c8a39daed715389e5686baab9b5.b64",
 )
+DONATION_URL = os.environ.get("DONATION_URL", "https://pay.cloudtips.ru/p/744333a8").strip()
+DONATION_RAISED_RUB = env_int("DONATION_RAISED_RUB", 0)
+DONATION_DAILY_COST_RUB = env_int("DONATION_DAILY_COST_RUB", 1000, 1)
+DONATION_STATS_TOKEN = os.environ.get("DONATION_STATS_TOKEN", "").strip()
+DONATION_SYNC_SECONDS = env_int("DONATION_SYNC_SECONDS", 60, 30)
+MAX_DONATION_RUB = 1_000_000_000
+CLOUDTIPS_PAYMENT_HOST = "pay.cloudtips.ru"
+BOT_ACTION_CONTEXT = threading.local()
+DONATION_LOCK = threading.Lock()
 
 
 def run(cmd, input_text=None, timeout=10):
@@ -77,7 +97,188 @@ def abs_public_url(path, params=None):
     return f"https://{HOST}{public_url(path, params)}"
 
 
+def safe_https_url(value):
+    value = (value or "").strip()
+    if any(char.isspace() or ord(char) < 32 for char in value):
+        return ""
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        _port = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or hostname.lower() != CLOUDTIPS_PAYMENT_HOST
+        or parsed.port not in (None, 443)
+        or parsed.username
+        or parsed.password
+        or not re.fullmatch(r"/p/[A-Za-z0-9]+", parsed.path)
+        or parsed.query
+        or parsed.fragment
+    ):
+        return ""
+    return value
+
+
+def format_rubles(value):
+    return f"{int(value):,}".replace(",", " ") + " ₽"
+
+
+def donation_state_int(values, key, default, minimum=0, maximum=MAX_DONATION_RUB * 1000):
+    try:
+        value = int(values.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def update_donation_accounting(observed_total=None, timestamp=None):
+    current_time = int(timestamp if timestamp is not None else time.time())
+    keys = (
+        "donation_raised_rub",
+        "donation_daily_cost_rub",
+        "donation_source_total_rub",
+        "donation_reserve_millirub",
+        "donation_spent_millirub",
+        "donation_accounted_at",
+        "donation_burn_remainder",
+    )
+    with DONATION_LOCK, portal_db() as db:
+        db.execute("begin immediate")
+        rows = db.execute(
+            "select key,value from app_state where key in (?,?,?,?,?,?,?)",
+            keys,
+        ).fetchall()
+        values = {row["key"]: row["value"] for row in rows}
+        daily = donation_state_int(values, "donation_daily_cost_rub", DONATION_DAILY_COST_RUB, 1, MAX_DONATION_RUB)
+        manual_raised = donation_state_int(values, "donation_raised_rub", DONATION_RAISED_RUB, 0, MAX_DONATION_RUB)
+        tracked = "donation_accounted_at" in values and "donation_reserve_millirub" in values
+        reserve_milli = donation_state_int(values, "donation_reserve_millirub", manual_raised * 1000)
+        spent_milli = donation_state_int(values, "donation_spent_millirub", 0)
+        source_total = donation_state_int(values, "donation_source_total_rub", manual_raised, 0, MAX_DONATION_RUB)
+        accounted_at = donation_state_int(values, "donation_accounted_at", current_time, 0, 4_102_444_800)
+        remainder = donation_state_int(values, "donation_burn_remainder", 0, 0, 86_399)
+
+        if observed_total is not None and "donation_source_total_rub" not in values:
+            source_total = max(0, min(int(observed_total), MAX_DONATION_RUB))
+            reserve_milli = source_total * 1000
+            spent_milli = 0
+            accounted_at = current_time
+            remainder = 0
+            tracked = True
+        elif tracked:
+            elapsed = max(0, current_time - accounted_at)
+            burn_numerator = daily * 1000 * elapsed + remainder
+            burned_milli = min(reserve_milli, burn_numerator // 86400)
+            reserve_milli -= burned_milli
+            spent_milli = min(MAX_DONATION_RUB * 1000, spent_milli + burned_milli)
+            remainder = burn_numerator % 86400
+            accounted_at = current_time
+
+        if observed_total is not None and "donation_source_total_rub" in values:
+            observed_total = max(0, min(int(observed_total), MAX_DONATION_RUB))
+            if observed_total > source_total:
+                reserve_milli = min(MAX_DONATION_RUB * 1000, reserve_milli + (observed_total - source_total) * 1000)
+                source_total = observed_total
+            tracked = True
+
+        if tracked:
+            updated = (
+                ("donation_raised_rub", str(reserve_milli // 1000)),
+                ("donation_source_total_rub", str(source_total)),
+                ("donation_reserve_millirub", str(reserve_milli)),
+                ("donation_spent_millirub", str(spent_milli)),
+                ("donation_accounted_at", str(accounted_at)),
+                ("donation_burn_remainder", str(remainder)),
+            )
+            db.executemany(
+                "insert into app_state(key,value) values(?,?) on conflict(key) do update set value=excluded.value",
+                updated,
+            )
+        return {
+            "raised": reserve_milli // 1000,
+            "total": source_total,
+            "spent": spent_milli // 1000,
+            "daily": daily,
+            "tracked": tracked,
+        }
+
+
+def donation_snapshot():
+    try:
+        accounting = update_donation_accounting()
+    except (OSError, sqlite3.Error):
+        accounting = {
+            "raised": DONATION_RAISED_RUB,
+            "total": DONATION_RAISED_RUB,
+            "spent": 0,
+            "daily": DONATION_DAILY_COST_RUB,
+            "tracked": False,
+        }
+    raised = accounting["raised"]
+    daily = accounting["daily"]
+    percent = min(100, (raised * 100 + daily // 2) // daily)
+    days = raised // daily
+    day_tenths = (raised * 10) // daily
+    days_text = f"{day_tenths // 10},{day_tenths % 10} дн."
+    return {
+        "raised": raised,
+        "total": accounting["total"],
+        "spent": accounting["spent"],
+        "daily": daily,
+        "percent": percent,
+        "days": days,
+        "days_text": days_text,
+        "url": safe_https_url(DONATION_URL),
+    }
+
+
+def parse_cloudtips_total(payload):
+    if not isinstance(payload, dict) or str(payload.get("title", "")).strip().casefold() != "всего":
+        return None
+    for item in payload.get("items", []):
+        match = re.search(r"(\d[\d\s\u00a0]*)(?:[,.]\d{1,2})?\s*₽", str(item))
+        if match:
+            digits = re.sub(r"\D", "", match.group(1))
+            if digits:
+                return min(int(digits), MAX_DONATION_RUB)
+    return None
+
+
+def fetch_cloudtips_total():
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", DONATION_STATS_TOKEN):
+        return None
+    url = f"https://streamers-api.cloudtips.ru/statistics/{DONATION_STATS_TOKEN}/init"
+    request = Request(
+        url,
+        headers={
+            "accept": "application/json",
+            "referer": f"https://stream.cloudtips.ru/s/{DONATION_STATS_TOKEN}",
+            "user-agent": "spaceigbot-donation-progress/1.0",
+        },
+    )
+    with urlopen(request, timeout=12) as response:
+        return parse_cloudtips_total(json.loads(response.read().decode("utf-8")))
+
+
+def donation_sync_loop():
+    while True:
+        try:
+            observed_total = fetch_cloudtips_total()
+            if observed_total is not None:
+                update_donation_accounting(observed_total)
+        except Exception:
+            pass
+        time.sleep(DONATION_SYNC_SECONDS)
+
+
 def telegram_api(method, payload=None, timeout=12):
+    collector = getattr(BOT_ACTION_CONTEXT, "actions", None)
+    if collector is not None:
+        collector.append({"method": method, "payload": payload})
+        return {"ok": True, "result": True}
     if not BOT_TOKEN:
         return None
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
@@ -235,6 +436,22 @@ def set_state(key, value):
         )
 
 
+def set_donation_state(raised, daily):
+    current_time = int(time.time())
+    values = (
+        ("donation_raised_rub", str(raised)),
+        ("donation_daily_cost_rub", str(daily)),
+        ("donation_reserve_millirub", str(raised * 1000)),
+        ("donation_accounted_at", str(current_time)),
+        ("donation_burn_remainder", "0"),
+    )
+    with portal_db() as db:
+        db.executemany(
+            "insert into app_state(key,value) values(?,?) on conflict(key) do update set value=excluded.value",
+            values,
+        )
+
+
 def init_db():
     os.makedirs(os.path.dirname(PORTAL_DB), exist_ok=True)
     with sqlite3.connect(PORTAL_DB) as db:
@@ -287,6 +504,19 @@ def init_db():
               status text not null default 'pending',
               admin_message_id integer,
               created_at text not null,
+              updated_at text not null
+            )
+            """
+        )
+        columns = {row[1] for row in db.execute("pragma table_info(pending_requests)").fetchall()}
+        if "notification_telegram_id" not in columns:
+            db.execute("alter table pending_requests add column notification_telegram_id integer")
+        db.execute(
+            """
+            create table if not exists bot_contacts (
+              username text primary key,
+              telegram_id integer not null,
+              first_name text default '',
               updated_at text not null
             )
             """
@@ -402,6 +632,13 @@ def create_pending_request(identity, requested_profiles):
     requested_profiles = max(1, min(int(requested_profiles or 1), MAX_PROFILES_PER_USERNAME))
     telegram_id = int(identity.get("telegram_id") or 0)
     with portal_db() as db:
+        notification_telegram_id = telegram_id
+        if not notification_telegram_id:
+            contact = db.execute(
+                "select telegram_id from bot_contacts where username=?",
+                (identity["username"],),
+            ).fetchone()
+            notification_telegram_id = int(contact["telegram_id"] or 0) if contact else 0
         if telegram_id:
             existing = db.execute(
                 "select * from pending_requests where telegram_id=? and status='pending' order by id desc limit 1",
@@ -414,17 +651,35 @@ def create_pending_request(identity, requested_profiles):
             ).fetchone()
         if existing:
             db.execute(
-                "update pending_requests set username=?, first_name=?, requested_profiles=?, updated_at=? where id=?",
-                (identity["username"], identity.get("first_name", ""), requested_profiles, now(), existing["id"]),
+                "update pending_requests set username=?, first_name=?, requested_profiles=?, notification_telegram_id=?, updated_at=? where id=?",
+                (
+                    identity["username"],
+                    identity.get("first_name", ""),
+                    requested_profiles,
+                    notification_telegram_id or None,
+                    now(),
+                    existing["id"],
+                ),
             )
             request_id = existing["id"]
         else:
             db.execute(
                 """
-                insert into pending_requests(telegram_id,username,first_name,requested_profiles,status,created_at,updated_at)
-                values(?,?,?,?, 'pending', ?, ?)
+                insert into pending_requests(
+                  telegram_id,username,first_name,requested_profiles,status,
+                  notification_telegram_id,created_at,updated_at
+                )
+                values(?,?,?,?, 'pending', ?, ?, ?)
                 """,
-                (telegram_id, identity["username"], identity.get("first_name", ""), requested_profiles, now(), now()),
+                (
+                    telegram_id,
+                    identity["username"],
+                    identity.get("first_name", ""),
+                    requested_profiles,
+                    notification_telegram_id or None,
+                    now(),
+                    now(),
+                ),
             )
             request_id = db.execute("select last_insert_rowid()").fetchone()[0]
     notify_admin_request(request_id)
@@ -577,13 +832,14 @@ def approve_request(request_id, max_profiles):
                 req["username"],
                 req["telegram_id"] if int(req["telegram_id"] or 0) else None,
                 max_profiles,
-                f"approved by bot for {'browser request' if int(req['telegram_id'] or 0) == 0 else 'tg_id ' + str(req['telegram_id'])}",
+                f"approved request for {'browser request' if int(req['telegram_id'] or 0) == 0 else 'tg_id ' + str(req['telegram_id'])}",
                 now(),
                 now(),
             ),
         )
         db.execute("update pending_requests set status='approved', requested_profiles=?, updated_at=? where id=?", (max_profiles, now(), request_id))
-        return req
+    notify_user_approved(req, max_profiles)
+    return req
 
 
 def deny_request(request_id):
@@ -601,6 +857,68 @@ def portal_inline_keyboard(url=None):
     return {"inline_keyboard": buttons}
 
 
+def remember_bot_contact(sender):
+    telegram_id = int(sender.get("id") or 0)
+    username = norm_username(sender.get("username", ""))
+    if not telegram_id or not username:
+        return
+    with portal_db() as db:
+        db.execute("delete from bot_contacts where telegram_id=? and username<>?", (telegram_id, username))
+        db.execute(
+            """
+            insert into bot_contacts(username,telegram_id,first_name,updated_at)
+            values(?,?,?,?)
+            on conflict(username) do update set
+              telegram_id=excluded.telegram_id,
+              first_name=excluded.first_name,
+              updated_at=excluded.updated_at
+            """,
+            (username, telegram_id, sender.get("first_name", ""), now()),
+        )
+        db.execute(
+            """
+            update pending_requests
+            set notification_telegram_id=?, updated_at=?
+            where username=? and telegram_id=0 and status='pending'
+            """,
+            (telegram_id, now(), username),
+        )
+
+
+def notify_user_approved(req, max_profiles):
+    if not BOT_TOKEN:
+        return
+    telegram_id = int(req["telegram_id"] or 0)
+    if not telegram_id and "notification_telegram_id" in req.keys():
+        telegram_id = int(req["notification_telegram_id"] or 0)
+    if not telegram_id:
+        return
+    try:
+        login_url = ""
+        if int(req["telegram_id"] or 0):
+            login_url, _username = create_bot_login_url(
+                {
+                    "id": telegram_id,
+                    "username": req["username"],
+                    "first_name": req["first_name"] or "",
+                }
+            )
+        telegram_api(
+            "sendMessage",
+            {
+                "chat_id": telegram_id,
+                "text": (
+                    f"Доступ к VPN одобрен. Лимит профилей: {max_profiles}.\n\n"
+                    "Откройте личный кабинет: там будут WireGuard QR, .conf, "
+                    "инструкция для Amnezia и личная Happ-ссылка."
+                ),
+                "reply_markup": portal_inline_keyboard(login_url or abs_public_url("/manual")),
+            },
+        )
+    except Exception as exc:
+        print(f"approval notification failed: {type(exc).__name__}", flush=True)
+
+
 def public_site_keyboard():
     return {
         "inline_keyboard": [
@@ -608,6 +926,46 @@ def public_site_keyboard():
             [{"text": "Войти по username", "url": abs_public_url("/manual")}],
         ]
     }
+
+
+def donation_inline_keyboard(include_progress=False):
+    snapshot = donation_snapshot()
+    buttons = []
+    if snapshot["url"]:
+        buttons.append([{"text": "💳 Поддержать через CloudTips", "url": snapshot["url"]}])
+    if include_progress:
+        buttons.append([{"text": "🌐 Смотреть прогресс", "url": abs_public_url("/donate")}])
+    return {"inline_keyboard": buttons}
+
+
+def donation_web_app_keyboard():
+    return {
+        "keyboard": [[{"text": "🌐 Открыть прогресс сбора", "web_app": {"url": abs_public_url("/donate")}}]],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "Свободный интернет — общая сеть",
+    }
+
+
+def donation_bot_text():
+    snapshot = donation_snapshot()
+    filled = min(10, snapshot["percent"] // 10)
+    if snapshot["percent"] and not filled:
+        filled = 1
+    bar = "■" * filled + "□" * (10 - filled)
+    payment_hint = "\n\nСсылка на сбор — по кнопке ниже." if snapshot["url"] else "\n\nСсылка на сбор пока настраивается."
+    return (
+        "🌐 Фонд свободного интернета им. ИИгоря\n\n"
+        "Мы оплачиваем серверы и резервные каналы, чтобы доступ ко всемирному интернету "
+        "оставался свободным и устойчивым. Фонду тоже нужна поддержка — вместе мы держим эту сеть доступной.\n\n"
+        f"Ресурс ближайшего дня: {bar}  {snapshot['percent']}%\n"
+        f"Собрано за всё время: {format_rubles(snapshot['total'])}\n"
+        f"Сейчас в резерве: {format_rubles(snapshot['raised'])}\n"
+        f"Израсходовано со старта учёта: {format_rubles(snapshot['spent'])}\n"
+        f"Ресурсы: около {format_rubles(snapshot['daily'])} в день\n"
+        f"Этого хватит: {snapshot['days_text']}"
+        f"{payment_hint}"
+    )
 
 
 def safe_next_path(value):
@@ -689,26 +1047,6 @@ def handle_bot_callback(callback):
                     "text": f"Одобрено: @{req['username']}, лимит профилей {count}",
                 },
             )
-            if int(req["telegram_id"] or 0):
-                login_url, _username = create_bot_login_url(
-                    {
-                        "id": req["telegram_id"],
-                        "username": req["username"],
-                        "first_name": req["first_name"] or "",
-                    }
-                )
-                telegram_api(
-                    "sendMessage",
-                    {
-                        "chat_id": req["telegram_id"],
-                        "text": (
-                            f"Доступ к VPN одобрен. Лимит профилей: {count}.\n\n"
-                            "Откройте личный кабинет в браузере: там будут WireGuard QR, .conf, "
-                            "инструкция для Amnezia и личная Happ-ссылка."
-                        ),
-                        "reply_markup": portal_inline_keyboard(login_url or abs_public_url("/")),
-                    },
-                )
         else:
             telegram_api("answerCallbackQuery", {"callback_query_id": callback["id"], "text": "Заявка уже обработана", "show_alert": True})
     elif action == "deny":
@@ -734,6 +1072,28 @@ def handle_bot_message(message):
     chat_id = message.get("chat", {}).get("id")
     command, payload = bot_command_parts(text)
     sender = message.get("from", {})
+    if message.get("chat", {}).get("type") == "private":
+        remember_bot_contact(sender)
+    if command == "/donate" and chat_id:
+        is_private = message.get("chat", {}).get("type") == "private"
+        telegram_api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": donation_bot_text(),
+                "reply_markup": donation_inline_keyboard(include_progress=not is_private),
+            },
+        )
+        if is_private:
+            telegram_api(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": "Откройте Mini App, чтобы наблюдать ресурсный запас и сколько дней работы уже обеспечено.",
+                    "reply_markup": donation_web_app_keyboard(),
+                },
+            )
+        return
     if command in ("/admin", "/monitor") and chat_id:
         if int(sender.get("id", 0)) not in ADMIN_IDS:
             telegram_api(
@@ -777,6 +1137,15 @@ def handle_bot_message(message):
                 "reply_markup": public_site_keyboard(),
             },
         )
+        if command == "/start" and message.get("chat", {}).get("type") == "private":
+            telegram_api(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": "Следите за запасом ресурсов фонда и поддерживайте свободный интернет в Mini App.",
+                    "reply_markup": donation_web_app_keyboard(),
+                },
+            )
         return
     if command != "/start" or not payload.startswith("login_"):
         return
@@ -811,6 +1180,13 @@ def handle_bot_message(message):
             )
 
 
+def handle_bot_update(update):
+    if "callback_query" in update:
+        handle_bot_callback(update["callback_query"])
+    if "message" in update:
+        handle_bot_message(update["message"])
+
+
 def bot_poll_loop():
     if not BOT_TOKEN:
         return
@@ -820,10 +1196,7 @@ def bot_poll_loop():
             result = telegram_api("getUpdates", {"offset": offset, "timeout": 25, "allowed_updates": ["callback_query", "message"]}, timeout=35)
             for update in result.get("result", []) if result else []:
                 offset = max(offset, update["update_id"] + 1)
-                if "callback_query" in update:
-                    handle_bot_callback(update["callback_query"])
-                if "message" in update:
-                    handle_bot_message(update["message"])
+                handle_bot_update(update)
             set_state("telegram_update_offset", offset)
         except Exception:
             time.sleep(5)
@@ -839,6 +1212,7 @@ def setup_bot_menu():
                 "commands": [
                     {"command": "start", "description": "Открыть сайт VPN и отправить заявку"},
                     {"command": "help", "description": "Как получить доступ к VPN"},
+                    {"command": "donate", "description": "Поддержать фонд и посмотреть прогресс"},
                     {"command": "monitor", "description": "Открыть мониторинг для администратора"},
                     {"command": "admin", "description": "Открыть админку для администратора"},
                 ]
@@ -971,6 +1345,12 @@ def client_config(client_id):
     return "\n".join(lines) + "\n"
 
 
+def download_config_filename(profile_name, fallback_id):
+    match = re.search(r"_(\d+)$", profile_name or "")
+    suffix = match.group(1) if match else str(fallback_id)
+    return f"MegaMonstrIG{suffix}.conf"
+
+
 def qr_svg(text):
     with tempfile.NamedTemporaryFile("w+", delete=False) as f:
         f.write(text)
@@ -1055,10 +1435,14 @@ class Handler(BaseHTTPRequestHandler):
     def clear_login_cookie(self):
         self.send_header("set-cookie", "vpn_login=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax")
 
-    def send_html(self, body, status=200):
+    def send_html(self, body, status=200, cache_control=None):
         data = body.encode()
         self.send_response(status)
         self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("x-content-type-options", "nosniff")
+        self.send_header("referrer-policy", "no-referrer")
+        if cache_control:
+            self.send_header("cache-control", cache_control)
         self.send_header("content-length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1103,6 +1487,8 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         if path.startswith("/monitor"):
             self.proxy_monitor(path)
+        elif path == "/donate":
+            self.send_html(self.donation_mini_app_page(), cache_control="no-store")
         elif path == "/app":
             self.redirect(public_url("/"))
         elif path in ("/", ""):
@@ -1140,6 +1526,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/internal/bot/update":
+            self.handle_bot_relay_update()
+            return
         params = self.body_params()
         if path.startswith("/monitor"):
             self.proxy_monitor(path, method="POST", params=params)
@@ -1175,6 +1564,23 @@ class Handler(BaseHTTPRequestHandler):
                         """,
                         (username, None, max_profiles, note, now(), now()),
                     )
+            self.redirect(public_url("/admin"))
+        elif path == "/admin/donation":
+            session = self.session()
+            if not session or session["role"] != "admin":
+                self.send_login_page("Нужен вход администратора.", 401)
+                return
+            origin = self.headers.get("origin", "")
+            if origin and origin != f"https://{HOST}":
+                self.send_html(page("Ошибка", "<h1>Недопустимый источник запроса</h1>"), 403)
+                return
+            try:
+                raised = max(0, min(int(params.get("raised", "0") or "0"), MAX_DONATION_RUB))
+                daily = max(1, min(int(params.get("daily", "1000") or "1000"), MAX_DONATION_RUB))
+            except ValueError:
+                self.send_html(page("Ошибка", "<h1>Суммы должны быть целыми числами</h1><p><a class='btn secondary' href='" + public_url("/admin") + "'>Вернуться</a></p>"), 400)
+                return
+            set_donation_state(raised, daily)
             self.redirect(public_url("/admin"))
         elif path == "/admin/user/limit":
             session = self.session()
@@ -1212,6 +1618,39 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect(public_url("/admin"))
         else:
             self.send_html(page("Not found", "<h1>404</h1>"), 404)
+
+    def handle_bot_relay_update(self):
+        supplied = self.headers.get("authorization", "")
+        expected = "Bearer " + BOT_RELAY_SECRET
+        if not BOT_RELAY_SECRET or not hmac.compare_digest(supplied, expected):
+            self.send_json({"ok": False}, 403)
+            return
+        try:
+            length = int(self.headers.get("content-length", "0"))
+        except ValueError:
+            length = 0
+        if length < 2 or length > 1_000_000:
+            self.send_json({"ok": False}, 413)
+            return
+        try:
+            update = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json({"ok": False}, 400)
+            return
+        if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+            self.send_json({"ok": False}, 400)
+            return
+        actions = []
+        BOT_ACTION_CONTEXT.actions = actions
+        try:
+            handle_bot_update(update)
+        except Exception:
+            self.send_json({"ok": False}, 500)
+            return
+        finally:
+            if hasattr(BOT_ACTION_CONTEXT, "actions"):
+                del BOT_ACTION_CONTEXT.actions
+        self.send_json({"ok": True, "actions": actions})
 
     def send_login_page(self, message="", status=200):
         body = "<h1>VPN доступ</h1>" + support_block()
@@ -1277,6 +1716,73 @@ class Handler(BaseHTTPRequestHandler):
 """
         self.send_html(page("Вход по username", body), status)
 
+    def donation_mini_app_page(self):
+        snapshot = donation_snapshot()
+        raised = format_rubles(snapshot["raised"])
+        total = format_rubles(snapshot["total"])
+        spent = format_rubles(snapshot["spent"])
+        daily = format_rubles(snapshot["daily"])
+        donate_url = html.escape(snapshot["url"], quote=True)
+        if donate_url:
+            cta = f'<a id="donateCta" class="donate-cta" href="{donate_url}" target="_blank" rel="noopener noreferrer">Поддержать фонд <span aria-hidden="true">→</span></a>'
+            hint = "Ссылка на защищённую страницу сбора откроется во внешнем браузере."
+        else:
+            cta = '<span class="donate-cta disabled" aria-disabled="true">Ссылка на сбор настраивается</span>'
+            hint = "Прогресс уже виден, а ссылка для поддержки появится здесь после настройки."
+        return f'''<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Поддержать свободный интернет</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{{--ink:#e7f3ff;--muted:#8ea9c4;--sky:#020812;--panel:#061426;--line:#173f65;--mint:#4ebeff;--sun:#83dfff;--pink:#ff72a5;--shadow:#01040a}}
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:var(--sky);color:var(--ink);font-family:"Courier New",ui-monospace,monospace;background-image:linear-gradient(rgba(63,137,196,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(63,137,196,.035) 1px,transparent 1px);background-size:16px 16px}}
+main{{width:min(720px,100%);margin:0 auto;padding:calc(18px + env(safe-area-inset-top)) 16px calc(28px + env(safe-area-inset-bottom))}}
+.eyebrow{{margin:0 0 12px;color:var(--mint);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}}h1{{margin:0;max-width:620px;font-size:clamp(30px,9vw,54px);line-height:.98;letter-spacing:-.06em;text-wrap:balance}}.lead{{margin:18px 0 24px;color:var(--muted);font:16px/1.55 system-ui,sans-serif}}.lead p{{margin:0}}.lead p+p{{margin-top:8px;color:#b2c7dc}}
+.pixel-card{{overflow:hidden;border:2px solid var(--line);background:var(--panel);box-shadow:8px 8px 0 var(--shadow);padding:18px}}
+.pixel-scene{{position:relative;height:270px;margin:-18px -18px 18px;overflow:hidden;border-bottom:2px solid var(--line);background:linear-gradient(#030c19 0 72%,#071c31 72%);image-rendering:pixelated}}
+.stars,.stars:before{{position:absolute;inset:0;content:"";background-image:radial-gradient(circle,var(--sun) 1px,transparent 2px);background-size:37px 31px;opacity:.65}}
+.signal-map{{position:absolute;inset:0;width:100%;height:100%;overflow:visible}}.client-route{{fill:none;stroke:#245f90;stroke-width:4;stroke-linecap:square;stroke-linejoin:miter;stroke-dasharray:6 7;vector-effect:non-scaling-stroke}}.client-route.r2{{stroke:#3377a8}}.client-route.r3{{stroke:#1e507d}}.backbone{{fill:none;stroke:#2f75aa;stroke-width:5;stroke-linecap:square;stroke-linejoin:miter;stroke-dasharray:8 7;vector-effect:non-scaling-stroke}}.backbone.alt{{stroke:#225b8d}}.route-node{{fill:#051326;stroke:#58c9ff;stroke-width:3;vector-effect:non-scaling-stroke}}.route-core{{fill:#5bd0ff}}.client-station{{fill:#06182d;stroke:#387eac;stroke-width:3;vector-effect:non-scaling-stroke}}.client-screen{{fill:#0b3150;stroke:#66d2ff;stroke-width:2;vector-effect:non-scaling-stroke}}.client-pixel{{fill:#79dcff}}.client-label,.network-label{{fill:#8fc9ed;font:700 10px monospace;text-anchor:middle;letter-spacing:.08em}}.fund-box{{fill:#0a2342;stroke:#83dfff;stroke-width:5;vector-effect:non-scaling-stroke;filter:drop-shadow(6px 6px 0 #01050c)}}.fund-label{{fill:#dff6ff;font:900 18px monospace;text-anchor:middle}}.fund-heart{{fill:var(--pink);font:900 25px sans-serif;text-anchor:middle;animation:heart 1.4s steps(2,end) infinite}}.heart-signal{{fill:var(--pink);font:900 19px sans-serif;filter:drop-shadow(0 0 3px #ff72a5)}}.data-signal{{fill:var(--sun);stroke:#082a4a;stroke-width:4;vector-effect:non-scaling-stroke;filter:drop-shadow(0 0 4px #49bfff)}}.globe-ring{{fill:#031224;stroke:#54c5ff;stroke-width:6;vector-effect:non-scaling-stroke}}.globe-line{{fill:none;stroke:#54c5ff;stroke-width:5;vector-effect:non-scaling-stroke}}@keyframes heart{{50%{{transform:translateY(-3px) scale(1.1);fill:#ffc0d7}}}}
+.kicker{{margin:0;color:var(--mint);font-size:12px;font-weight:700;text-transform:uppercase}}h2{{margin:8px 0 10px;font-size:23px}}.explain{{color:var(--muted);font:15px/1.55 system-ui,sans-serif}}
+.amount{{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:22px}}.amount strong{{font-size:clamp(27px,8vw,40px);line-height:1}}.amount span{{color:var(--muted);font-size:13px;text-align:right}}
+.progress{{height:22px;margin:13px 0 8px;border:4px solid var(--ink);background:#07171b;padding:3px}}.progress span{{display:block;width:{snapshot['percent']}%;height:100%;background:repeating-linear-gradient(90deg,var(--sun) 0 11px,#ad773d 11px 14px);animation:load .7s steps(7,end) both}}@keyframes load{{from{{width:0}}}}
+.progress-label{{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:10px;white-space:nowrap}}.metrics{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0}}.metric{{min-height:94px;border:2px solid var(--line);background:#04111f;padding:12px}}.metric b{{display:block;margin-bottom:6px;color:var(--sun);font-size:20px}}.metric span{{color:var(--muted);font:13px/1.35 system-ui,sans-serif}}
+.loop{{border-left:4px solid var(--mint);margin:18px 0;padding:3px 0 3px 13px;font:15px/1.5 system-ui,sans-serif}}.donate-cta{{display:flex;align-items:center;justify-content:space-between;min-height:56px;margin-top:16px;padding:14px 16px;background:var(--mint);color:#04182b;border:2px solid #bcecff;box-shadow:5px 5px 0 #020916;font-weight:900;text-decoration:none}}.donate-cta:active{{transform:translate(3px,3px);box-shadow:2px 2px 0 #020916}}.donate-cta:focus-visible{{outline:3px solid var(--sun);outline-offset:4px}}.donate-cta.disabled{{background:#304d6d;color:#a9bdd5;border-color:#4a6988;box-shadow:none}}.hint{{margin:13px 2px;color:var(--muted);font:12px/1.45 system-ui,sans-serif}}
+@media(min-width:560px){{.pixel-card{{padding:24px}}.pixel-scene{{height:290px;margin:-24px -24px 22px}}}}@media(max-width:390px){{.metrics{{grid-template-columns:1fr}}.pixel-scene{{height:220px}}.progress-label{{font-size:9px;letter-spacing:-.03em}}}}
+@media(prefers-reduced-motion:reduce){{*,*:before,*:after{{animation:none!important;transition:none!important}}}}
+</style></head><body><main>
+<p class="eyebrow">Фонд свободного интернета им. ИИгоря</p>
+<h1>Свободный интернет — общая сеть.</h1>
+<div class="lead"><p>Фонд оплачивает серверы и резервные каналы, сохраняя доступ ко всемирному интернету.</p><p>Люди поддерживают фонд. Вместе мы сохраняем сеть свободной и доступной.</p></div>
+<section class="pixel-card" aria-labelledby="fund-title">
+  <div class="pixel-scene" aria-hidden="true"><div class="stars"></div>
+    <svg class="signal-map" viewBox="0 0 600 300" preserveAspectRatio="xMidYMid meet">
+      <g><rect class="client-station" x="18" y="24" width="70" height="62"/><rect class="client-screen" x="30" y="34" width="46" height="28"/><rect class="client-pixel" x="39" y="42" width="8" height="8"/><rect class="client-pixel" x="57" y="42" width="8" height="8"/><text class="client-label" x="53" y="78">КЛИЕНТ 1</text></g>
+      <g><rect class="client-station" x="18" y="119" width="70" height="62"/><rect class="client-screen" x="30" y="129" width="46" height="28"/><rect class="client-pixel" x="39" y="137" width="8" height="8"/><rect class="client-pixel" x="57" y="137" width="8" height="8"/><text class="client-label" x="53" y="173">КЛИЕНТ 2</text></g>
+      <g><rect class="client-station" x="18" y="214" width="70" height="62"/><rect class="client-screen" x="30" y="224" width="46" height="28"/><rect class="client-pixel" x="39" y="232" width="8" height="8"/><rect class="client-pixel" x="57" y="232" width="8" height="8"/><text class="client-label" x="53" y="268">КЛИЕНТ 3</text></g>
+      <path class="client-route r1" d="M88 55 H125 V82 H185 V112 H250"/><path class="client-route r2" d="M88 150 H155 V150 H205 V150 H250"/><path class="client-route r3" d="M88 245 H125 V218 H185 V188 H250"/>
+      <rect class="route-node" x="116" y="73" width="18" height="18"/><circle class="route-core" cx="125" cy="82" r="3"/><rect class="route-node" x="176" y="103" width="18" height="18"/><circle class="route-core" cx="185" cy="112" r="3"/><rect class="route-node" x="146" y="141" width="18" height="18"/><circle class="route-core" cx="155" cy="150" r="3"/><rect class="route-node" x="116" y="209" width="18" height="18"/><circle class="route-core" cx="125" cy="218" r="3"/><rect class="route-node" x="176" y="179" width="18" height="18"/><circle class="route-core" cx="185" cy="188" r="3"/>
+      <rect class="fund-box" x="250" y="105" width="100" height="90"/><text class="fund-heart" x="300" y="140">♥</text><text class="fund-label" x="300" y="169">ФОНД</text>
+      <text class="heart-signal">♥<animateMotion dur="2.5s" begin="-.2s" repeatCount="indefinite" path="M88 55 H125 V82 H185 V112 H250"/></text><text class="heart-signal">♥<animateMotion dur="3.2s" begin="-1.8s" repeatCount="indefinite" path="M250 112 H185 V82 H125 V55 H88"/></text>
+      <text class="heart-signal">♥<animateMotion dur="2.2s" begin="-1.1s" repeatCount="indefinite" path="M88 150 H155 H205 H250"/></text><text class="heart-signal">♥<animateMotion dur="2.9s" begin="-.6s" repeatCount="indefinite" path="M250 150 H205 H155 H88"/></text>
+      <text class="heart-signal">♥<animateMotion dur="2.7s" begin="-2.1s" repeatCount="indefinite" path="M88 245 H125 V218 H185 V188 H250"/></text><text class="heart-signal">♥<animateMotion dur="3.4s" begin="-1.3s" repeatCount="indefinite" path="M250 188 H185 V218 H125 V245 H88"/></text>
+      <path class="backbone" d="M350 122 H390 V54 H430 V82 H468 V42 H515 V108"/><path class="backbone alt" d="M350 150 H405 V118 H445 V160 H480 V132 H520 V150"/><path class="backbone" d="M350 178 H382 V232 H426 V202 H468 V250 H515 V190"/>
+      <rect class="route-node" x="381" y="45" width="18" height="18"/><circle class="route-core" cx="390" cy="54" r="3"/><rect class="route-node" x="421" y="73" width="18" height="18"/><circle class="route-core" cx="430" cy="82" r="3"/><rect class="route-node" x="459" y="33" width="18" height="18"/><circle class="route-core" cx="468" cy="42" r="3"/><rect class="route-node" x="396" y="109" width="18" height="18"/><circle class="route-core" cx="405" cy="118" r="3"/><rect class="route-node" x="436" y="151" width="18" height="18"/><circle class="route-core" cx="445" cy="160" r="3"/><rect class="route-node" x="373" y="223" width="18" height="18"/><circle class="route-core" cx="382" cy="232" r="3"/><rect class="route-node" x="417" y="193" width="18" height="18"/><circle class="route-core" cx="426" cy="202" r="3"/><rect class="route-node" x="459" y="241" width="18" height="18"/><circle class="route-core" cx="468" cy="250" r="3"/>
+      <circle class="data-signal" r="7"><animateMotion dur="2.8s" repeatCount="indefinite" path="M350 122 H390 V54 H430 V82 H468 V42 H515 V108"/></circle><circle class="data-signal" r="6"><animateMotion dur="3.1s" begin="-1.7s" repeatCount="indefinite" path="M515 108 H468 V42 H430 V54 H390 V122 H350"/></circle><circle class="data-signal" r="7"><animateMotion dur="2.4s" begin="-.8s" repeatCount="indefinite" path="M350 150 H405 V118 H445 V160 H480 V132 H520 V150"/></circle><circle class="data-signal" r="6"><animateMotion dur="3.3s" begin="-2.2s" repeatCount="indefinite" path="M350 178 H382 V232 H426 V202 H468 V250 H515 V190"/></circle>
+      <circle class="globe-ring" cx="550" cy="150" r="46"/><ellipse class="globe-line" cx="550" cy="150" rx="20" ry="46"/><path class="globe-line" d="M504 150 H596 M512 130 H588 M512 170 H588"/><text class="network-label" x="550" y="218">СВОБОДНЫЙ ИНТЕРНЕТ</text>
+    </svg>
+  </div>
+  <p class="kicker">Текущий сбор</p><h2 id="fund-title">Снабжаем сеть ресурсами</h2>
+  <p class="explain">≈ {daily} в день уходит на инфраструктуру: серверы, трафик, резервирование и стабильную работу доступа.</p>
+  <div class="amount"><strong>{raised}</strong><span>доступно сейчас<br>в ресурсном резерве</span></div>
+  <div class="progress" role="progressbar" aria-label="Прогресс сбора" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{snapshot['percent']}"><span></span></div>
+  <div class="progress-label"><span>ближайший день обеспечен на {snapshot['percent']}%</span><span>≈ {daily} / день</span></div>
+  <div class="metrics"><div class="metric"><b>{total}</b><span>Собрано с 20 июля</span></div><div class="metric"><b>{spent}</b><span>Израсходовано с 20 июля</span></div><div class="metric"><b>≈ {daily} / день</b><span>нужно для снабжения ресурсов</span></div><div class="metric"><b>{snapshot['days_text']}</b><span>работы уже обеспечено текущим резервом</span></div></div>
+  <p class="loop">Фонд поддерживает доступ. Мы поддерживаем фонд. Так свободный интернет остаётся доступным для всех.</p>
+  {cta}<p class="hint">{hint}</p>
+</section></main>
+<script>const tg=window.Telegram&&window.Telegram.WebApp;if(tg){{tg.ready();tg.expand();if(tg.MainButton)tg.MainButton.hide()}}const cta=document.getElementById('donateCta');if(cta)cta.addEventListener('click',function(event){{if(tg&&tg.openLink){{event.preventDefault();tg.openLink(this.href)}}}});</script>
+</body></html>'''
+
     def mini_app_page(self):
         return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VPN Mini App</title>
@@ -1297,6 +1803,7 @@ if (tg) {{
 }}
 const root = document.getElementById('app');
 let initData = '';
+let statusTimer = null;
 function setLoading(text, hint = '') {{
   root.innerHTML = `<div class="loader"><span class="spinner"></span><span>${{text}}</span></div>${{hint ? `<p class="muted">${{hint}}</p>` : ''}}`;
 }}
@@ -1315,6 +1822,7 @@ function renderError(text) {{
   root.innerHTML = `<p class="bad">${{text}}</p><p class="muted">Откройте этот экран из Telegram-бота @{html.escape(BOT_USERNAME)}.</p>`;
 }}
 function renderActions(data) {{
+  if (statusTimer) clearTimeout(statusTimer);
   const admin = data.role === 'admin';
   const username = data.username ? `@${{data.username}}` : 'username не получен';
   const accessText = data.access
@@ -1324,12 +1832,14 @@ function renderActions(data) {{
     <p class="ok">Вход выполнен: ${{username}}</p>
     <p class="muted">${{accessText}}</p>
     <a class="btn" data-loading="Открываю профили..." href="{public_url('/')}">Профили и заявки</a>
-    ${{!data.access ? `<button class="btn secondary" id="requestBtn" type="button">Запросить доступ</button>` : ''}}
+    ${{data.pending ? `<p class="muted">Статус обновится автоматически через 30 секунд.</p>` : ''}}
+    ${{!data.access && !data.pending ? `<button class="btn secondary" id="requestBtn" type="button">Запросить доступ</button>` : ''}}
     ${{admin ? `<a class="btn secondary" data-loading="Открываю админку..." href="{public_url('/admin')}">Админка</a><a class="btn secondary" data-loading="Загружаю мониторинг..." href="https://{HOST}/monitor/">Мониторинг</a>` : ''}}
   `;
   const requestBtn = document.getElementById('requestBtn');
   if (requestBtn) requestBtn.addEventListener('click', () => renderRequestForm(data.username || ''));
   bindLoadingLinks();
+  if (data.pending && !data.access) statusTimer = setTimeout(boot, 30000);
 }}
 function renderRequestForm(username = '') {{
   root.innerHTML = `
@@ -1574,7 +2084,7 @@ boot();
         if not user:
             pending = get_pending_request_for_identity(session)
             if pending:
-                content += f"""<div class='card pending-box'><div class="pending-line"><span class="spinner"></span><div><h2>Заявка на подтверждении</h2><p class="muted">Запрошено профилей: <b>{pending['requested_profiles']}</b>. Администратор уже получил заявку. Страница сама обновится, и когда доступ будет одобрен, здесь появится выдача профилей.</p></div></div><p class="muted">Проверяю статус каждые 10 секунд. Можно оставить вкладку открытой.</p><script>setTimeout(() => window.location.reload(), 10000);</script></div>"""
+                content += f"""<div class='card pending-box'><div class="pending-line"><span class="spinner"></span><div><h2>Заявка на подтверждении</h2><p class="muted">Запрошено профилей: <b>{pending['requested_profiles']}</b>. Администратор уже получил заявку. Страница сама обновится, и когда доступ будет одобрен, здесь появится выдача профилей.</p></div></div><p class="muted">Проверяю статус каждые 30 секунд. Можно оставить вкладку открытой.</p><script>setTimeout(() => window.location.reload(), 30000);</script></div>"""
             else:
                 content += f"""<form method="post" action="{public_url('/claim')}"><h2>Запросить доступ</h2><p class="muted">@{html.escape(username)} пока не добавлен в список доступа. Укажите, сколько профилей нужно, и заявка уйдет администратору.</p><label>Сколько профилей нужно</label><input type="number" min="1" max="{MAX_PROFILES_PER_USERNAME}" name="count" value="1"><button>Отправить заявку</button></form>"""
         else:
@@ -1639,6 +2149,9 @@ boot();
         stats = portal_stats()
         requests = list_pending_requests()
         pending = [r for r in requests if r["status"] == "pending"]
+        donation = donation_snapshot()
+        cloudtips_status = "CloudTips-ссылка настроена" if donation["url"] else "CloudTips-ссылка будет добавлена позже"
+        statistics_status = "Автоматическая статистика настроена" if DONATION_STATS_TOKEN else "Автоматическая статистика не настроена"
         body = f"""<h1>Админка VPN</h1><p class='muted'>Вход: @{html.escape(session['username'])} · <a class='btn secondary' data-loading='Открываю кабинет...' href='{public_url('/')}'>Кабинет</a> <a class='btn secondary' data-loading='Загружаю мониторинг...' href='/monitor/'>Мониторинг</a> <a class='btn secondary' href='{public_url('/logout')}'>Выйти</a></p>
 <section class="admin-top">
   <div class="metric"><span class="muted">Ожидают решения</span><b>{stats['pending']}</b></div>
@@ -1646,6 +2159,18 @@ boot();
   <div class="metric"><span class="muted">Выдано профилей</span><b>{stats['issued']}</b></div>
   <div class="metric"><span class="muted">Всего заявок</span><b>{stats['requests']}</b></div>
 </section>
+<form method="post" action="{public_url('/admin/donation')}">
+  <h2>Сбор CloudTips</h2>
+  <p class="muted">{cloudtips_status}. {statistics_status}. Ручное значение ниже работает как аварийная корректировка текущего резерва.</p>
+  <div class="grid">
+    <label>Текущий резерв, ₽<input name="raised" type="number" min="0" max="{MAX_DONATION_RUB}" step="1" value="{donation['raised']}" required></label>
+    <label>Расход в день, ₽<input name="daily" type="number" min="1" max="{MAX_DONATION_RUB}" step="1" value="{donation['daily']}" required></label>
+    <div><label>Собрано / израсходовано</label><p><b>{format_rubles(donation['total'])}</b> / {format_rubles(donation['spent'])}</p></div>
+    <div><label>Сейчас обеспечено</label><p><b>{donation['days_text']}</b> · ближайший день на {donation['percent']}%</p></div>
+  </div>
+  <button type="submit">Обновить прогресс</button>
+  <a class="btn secondary" href="{public_url('/donate')}" target="_blank" rel="noopener noreferrer">Открыть Mini App</a>
+</form>
 <section class="admin-grid">
   <form method="post" action="{public_url('/admin/user')}"><h2>Доступ пользователя</h2><p class="muted">Добавьте username, измените лимит или временно поставьте `0`, чтобы новые профили не создавались.</p><label>Telegram username</label><input name="username" placeholder="@username" required><label>Максимум профилей</label><input name="max_profiles" type="number" min="0" max="{MAX_PROFILES_PER_USERNAME}" value="1"><p class="muted">Жесткий максимум: {MAX_PROFILES_PER_USERNAME}</p><label>Заметка</label><textarea name="note" rows="3" placeholder="Кто это, когда оплачен, что выдано"></textarea><button>Сохранить доступ</button></form>
   <div class="card"><h2>Новые заявки</h2>"""
@@ -1687,15 +2212,19 @@ boot();
             self.end_headers()
             return
         with portal_db() as db:
-            ok = db.execute("select 1 from issued_profiles where username=? and wg_client_id=?", (username, client_id)).fetchone()
-        if not ok:
+            profile = db.execute(
+                "select name from issued_profiles where username=? and wg_client_id=?",
+                (username, client_id),
+            ).fetchone()
+        if not profile:
             self.send_response(404)
             self.end_headers()
             return
         config = client_config(client_id).encode()
+        filename = download_config_filename(profile["name"], client_id)
         self.send_response(200)
         self.send_header("content-type", "application/x-wireguard-config")
-        self.send_header("content-disposition", f'attachment; filename="wg-{username}-{client_id}.conf"')
+        self.send_header("content-disposition", f'attachment; filename="{filename}"')
         self.send_header("content-length", str(len(config)))
         self.end_headers()
         self.wfile.write(config)
@@ -1785,6 +2314,9 @@ boot();
 
 if __name__ == "__main__":
     init_db()
-    setup_bot_menu()
-    threading.Thread(target=bot_poll_loop, daemon=True).start()
+    threading.Thread(target=setup_bot_menu, daemon=True).start()
+    if DONATION_STATS_TOKEN:
+        threading.Thread(target=donation_sync_loop, daemon=True).start()
+    if BOT_POLLING_ENABLED:
+        threading.Thread(target=bot_poll_loop, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", 8091), Handler).serve_forever()
