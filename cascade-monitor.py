@@ -3,6 +3,7 @@ import html
 import json
 import os
 import subprocess
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
@@ -14,6 +15,26 @@ WIREGUARD_ONLY = os.environ.get("CASCADE_WIREGUARD_ONLY", "0").strip().lower() i
 EXITS = []
 
 BASE_SERVICES = ["cascade-routing.service", "cascade-health.timer", "docker.service", "caddy.service"]
+
+
+def env_int(name, default, minimum, maximum):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+CACHE_INTERVAL = env_int("CASCADE_MONITOR_CACHE_INTERVAL", 30, 10, 300)
+CACHE_MAX_AGE = max(60, CACHE_INTERVAL * 3)
+CLIENT_SOCKET_TIMEOUT = 5
+MAX_POST_BODY = 64 * 1024
+MAX_HTTP_WORKERS = 8
+CACHE_LOCK = threading.Lock()
+CACHE_REFRESH = threading.Event()
+CACHE_DATA = None
+CACHE_UPDATED = 0.0
+CACHE_ERROR = ""
 
 
 def run(cmd, timeout=4):
@@ -264,6 +285,75 @@ def collect():
     }
 
 
+def refresh_cache():
+    global CACHE_DATA, CACHE_UPDATED, CACHE_ERROR
+    try:
+        data = collect()
+    except Exception as exc:
+        with CACHE_LOCK:
+            CACHE_ERROR = str(exc)
+        return False
+    with CACHE_LOCK:
+        CACHE_DATA = data
+        CACHE_UPDATED = time.monotonic()
+        CACHE_ERROR = ""
+    return True
+
+
+def cache_snapshot():
+    with CACHE_LOCK:
+        data = CACHE_DATA
+        updated = CACHE_UPDATED
+        error = CACHE_ERROR
+    age = max(0.0, time.monotonic() - updated) if updated else None
+    return data, age, error
+
+
+def cached_api_data():
+    data, age, error = cache_snapshot()
+    if data is None:
+        return None
+    result = dict(data)
+    result["cache"] = {
+        "age_seconds": round(age, 1),
+        "interval_seconds": CACHE_INTERVAL,
+        "max_age_seconds": CACHE_MAX_AGE,
+        "last_error": error,
+    }
+    return result
+
+
+def collector_loop():
+    while True:
+        refresh_cache()
+        CACHE_REFRESH.wait(CACHE_INTERVAL)
+        CACHE_REFRESH.clear()
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, server_address, handler_class):
+        self.request_slots = threading.BoundedSemaphore(MAX_HTTP_WORKERS)
+        super().__init__(server_address, handler_class)
+
+    def process_request(self, request, client_address):
+        if not self.request_slots.acquire(blocking=False):
+            self.close_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_slots.release()
+
+
 def fmt_bytes(n):
     try:
         n = int(n)
@@ -427,6 +517,10 @@ document.getElementById('copyJson').addEventListener('click',async e=>{{try{{con
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(CLIENT_SOCKET_TIMEOUT)
+
     def log_message(self, _fmt, *_args):
         return
 
@@ -435,13 +529,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        self.send_response(200)
+        data, age, _error = cache_snapshot()
+        healthy = data is not None and age is not None and age <= CACHE_MAX_AGE
+        status = 200 if data is not None else 503
+        if self.path == "/health":
+            status = 200 if healthy else 503
+        self.send_response(status)
         if self.path.startswith("/api"):
             self.send_header("content-type", "application/json; charset=utf-8")
         elif self.path == "/health":
             self.send_header("content-type", "text/plain; charset=utf-8")
         else:
             self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("cache-control", "no-store")
         self.end_headers()
 
     def do_GET(self):
@@ -450,21 +550,51 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.path == "/health":
-            self.send_response(200)
+            data, age, error = cache_snapshot()
+            healthy = data is not None and age is not None and age <= CACHE_MAX_AGE
+            age_text = "unknown" if age is None else f"{age:.1f}"
+            body = f"{'ok' if healthy else 'stale'} age={age_text} error={error or '-'}\n".encode()
+            self.send_response(200 if healthy else 503)
+            self.send_header("content-type", "text/plain; charset=utf-8")
+            self.send_header("cache-control", "no-store")
+            self.send_header("content-length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"ok\n")
+            self.wfile.write(body)
             return
-        data = collect()
         if self.path.startswith("/api"):
+            data = cached_api_data()
+            if data is None:
+                body = json.dumps({"error": "status cache is not ready"}).encode()
+                self.send_response(503)
+                self.send_header("content-type", "application/json; charset=utf-8")
+                self.send_header("cache-control", "no-store")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             body = json.dumps(data, ensure_ascii=False, indent=2).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json; charset=utf-8")
+            self.send_header("cache-control", "no-store")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        data, _age, _error = cache_snapshot()
+        if data is None:
+            body = b"<h1>Status cache is not ready</h1>"
+            self.send_response(503)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("cache-control", "no-store")
+            self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
             return
         body = render_html(data).encode()
         self.send_response(200)
         self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("cache-control", "no-store")
+        self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -473,7 +603,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        length = int(self.headers.get("content-length", "0") or "0")
+        try:
+            length = int(self.headers.get("content-length", "0") or "0")
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_POST_BODY:
+            self.send_response(413)
+            self.end_headers()
+            return
         raw = self.rfile.read(length).decode()
         try:
             result = save_weights(parse_qs(raw))
@@ -484,6 +621,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        CACHE_REFRESH.set()
         if not result["ok"]:
             body = f"<h1>Не удалось применить веса</h1><pre>{html.escape(result['err'] or result['out'])}</pre><p><a href='/'>Назад</a></p>".encode()
             self.send_response(500)
@@ -497,4 +635,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", 8090), Handler).serve_forever()
+    threading.Thread(target=collector_loop, name="status-collector", daemon=True).start()
+    BoundedThreadingHTTPServer(("127.0.0.1", 8090), Handler).serve_forever()
