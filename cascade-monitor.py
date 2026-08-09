@@ -12,7 +12,12 @@ WEIGHTS_FILE = "/etc/cascade/exit-weights.conf"
 CASCADE_HEALTH = "/usr/local/sbin/cascade-health"
 NETWORK_FILE = os.environ.get("CASCADE_NETWORK_FILE", "/etc/cascade/network.json")
 WIREGUARD_ONLY = os.environ.get("CASCADE_WIREGUARD_ONLY", "0").strip().lower() in ("1", "true", "yes")
-EXITS = []
+EXITS = [
+    {"name": "HELs-1", "iface": "wg-exit-hel1", "probe": "10.77.3.2", "expected_ip": "45.129.124.11", "weight": 10, "mode": "auto"},
+    {"name": "AMS-3", "iface": "wg-exit-ams3", "probe": "10.77.7.2", "expected_ip": "45.94.37.67", "weight": 10, "mode": "auto"},
+    {"name": "AMS-1", "iface": "wg-exit-ams1", "probe": "10.77.1.2", "expected_ip": "176.124.201.26", "weight": 3, "mode": "auto"},
+    {"name": "AMS-2", "iface": "wg-exit-ams2", "probe": "10.77.2.2", "expected_ip": "185.125.202.109", "weight": 1, "mode": "auto"},
+]
 
 BASE_SERVICES = ["cascade-routing.service", "cascade-health.timer", "docker.service", "caddy.service"]
 

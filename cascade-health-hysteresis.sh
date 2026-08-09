@@ -13,13 +13,11 @@ PING_TIMEOUT=2
 
 # name ifname probe_ip weight
 EXITS='hel1 wg-exit-hel1 10.77.3.2 10
-de1 wg-exit-de1 10.77.4.2 10
-vie1 wg-exit-vie1 10.77.6.2 10
 ams3 wg-exit-ams3 10.77.7.2 10
 ams1 wg-exit-ams1 10.77.1.2 3
 ams2 wg-exit-ams2 10.77.2.2 1'
 
-RESERVE_EXIT='ru1 wg-exit-ru1 10.77.5.2'
+RESERVE_EXIT=''
 
 mkdir -p "$STATE_DIR"
 
@@ -109,9 +107,11 @@ build_route() {
     fi
   done <<< "$EXITS"
 
-  read -r _rname riface rip <<< "$RESERVE_EXIT"
-  if update_probe_state "$_rname" "$riface" "$rip"; then
-    reserve_alive=1
+  if [[ -n "$RESERVE_EXIT" ]]; then
+    read -r _rname riface rip <<< "$RESERVE_EXIT"
+    if update_probe_state "$_rname" "$riface" "$rip"; then
+      reserve_alive=1
+    fi
   fi
 
   if [[ "$alive" -eq 0 ]]; then

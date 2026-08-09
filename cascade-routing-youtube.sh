@@ -8,6 +8,7 @@ TABLE_ID="100"
 YOUTUBE_TABLE_ID="102"
 RESERVE_TABLE_ID="101"
 HYSTERIA_UID="$(id -u hysteria 2>/dev/null || true)"
+TELEMT_UID="$(id -u telemt 2>/dev/null || echo 4294967294)"
 RU_URL="https://www.ipdeny.com/ipblocks/data/countries/ru.zone"
 WORK_DIR="/etc/cascade"
 RU_FILE="$WORK_DIR/ru.zone"
@@ -19,12 +20,22 @@ RESERVE_DOMAINS_FILE="$WORK_DIR/reserve-domains.txt"
 YOUTUBE_DOMAINS_FILE="$WORK_DIR/youtube-domains.txt"
 TELEGRAM_FILE="$WORK_DIR/telegram4.zone"
 NFT_FILE="$WORK_DIR/cascade.nft"
+MTPROTO_PROXY_IP="${MTPROTO_PROXY_IP:-172.30.90.2}"
 TMP_RU="$(mktemp)"
-trap 'rm -f "$TMP_RU"' EXIT
+TMP_RU_VALID="$(mktemp)"
+trap 'rm -f "$TMP_RU" "$TMP_RU_VALID"' EXIT
 
 mkdir -p "$WORK_DIR"
-curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 "$RU_URL" > "$TMP_RU"
-grep -E '^[0-9]+(\.[0-9]+){3}/[0-9]+$' "$TMP_RU" > "$RU_FILE"
+if curl --http1.1 -fsSL --retry 3 --retry-all-errors --connect-timeout 10 --max-time 30 "$RU_URL" > "$TMP_RU" \
+  && grep -E '^[0-9]+(\.[0-9]+){3}/[0-9]+$' "$TMP_RU" > "$TMP_RU_VALID" \
+  && [ -s "$TMP_RU_VALID" ]; then
+  install -m 0644 "$TMP_RU_VALID" "$RU_FILE"
+elif [ -s "$RU_FILE" ]; then
+  echo "warning: RU CIDR refresh failed; using cached $RU_FILE" >&2
+else
+  echo "error: RU CIDR refresh failed and no cached $RU_FILE is available" >&2
+  exit 1
+fi
 
 cat > "$DIRECT_FILE" <<'DIRECT'
 0.0.0.0/8
@@ -41,9 +52,6 @@ cat > "$DIRECT_FILE" <<'DIRECT'
 176.124.201.26/32
 185.125.202.109/32
 45.129.124.11/32
-51.250.41.144/32
-213.176.114.234/32
-45.86.245.60/32
 45.94.37.67/32
 DIRECT
 cat "$RU_FILE" >> "$DIRECT_FILE"
@@ -119,6 +127,7 @@ cat > "$TELEGRAM_FILE" <<'TELEGRAM'
 91.108.16.0/22
 91.108.20.0/22
 91.108.56.0/22
+91.105.192.0/23
 149.154.160.0/20
 185.76.151.0/24
 TELEGRAM
@@ -165,6 +174,7 @@ table inet cascade {
 
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
+    ip saddr $MTPROTO_PROXY_IP ip daddr @telegram4 counter meta mark set $MARK
     ip saddr 10.42.42.42 ip daddr @youtube4 counter meta mark set $YOUTUBE_MARK
     ip saddr 10.42.42.42 ip daddr @reserve4 counter meta mark set $RESERVE_MARK
     ip saddr 10.42.42.42 ip daddr != @direct4 ip daddr != @reserve4 counter meta mark set $MARK
@@ -172,6 +182,7 @@ table inet cascade {
 
   chain output {
     type route hook output priority mangle; policy accept;
+    meta skuid $TELEMT_UID ip daddr @telegram4 counter meta mark set $MARK
     meta skuid $HYSTERIA_UID ip6 daddr ::/0 counter reject
     meta skuid $HYSTERIA_UID udp dport 53 counter accept
     meta skuid $HYSTERIA_UID ip daddr @youtube4 counter meta mark set $YOUTUBE_MARK
@@ -184,21 +195,16 @@ table inet cascade {
     ip daddr @telegram4 oifname "wg-exit-ams1" snat ip to 10.77.1.1
     ip daddr @telegram4 oifname "wg-exit-ams2" snat ip to 10.77.2.1
     ip daddr @telegram4 oifname "wg-exit-hel1" snat ip to 10.77.3.1
-    ip daddr @telegram4 oifname "wg-exit-de1" snat ip to 10.77.4.1
-    ip daddr @telegram4 oifname "wg-exit-vie1" snat ip to 10.77.6.1
     ip daddr @telegram4 oifname "wg-exit-ams3" snat ip to 10.77.7.1
-    ip daddr @telegram4 oifname "wg-exit-ru1" snat ip to 10.77.5.1
     meta skuid $HYSTERIA_UID oifname "wg-exit-ams1" snat ip to 10.77.1.1
     meta skuid $HYSTERIA_UID oifname "wg-exit-ams2" snat ip to 10.77.2.1
     meta skuid $HYSTERIA_UID oifname "wg-exit-hel1" snat ip to 10.77.3.1
-    meta skuid $HYSTERIA_UID oifname "wg-exit-de1" snat ip to 10.77.4.1
-    meta skuid $HYSTERIA_UID oifname "wg-exit-vie1" snat ip to 10.77.6.1
     meta skuid $HYSTERIA_UID oifname "wg-exit-ams3" snat ip to 10.77.7.1
-    meta skuid $HYSTERIA_UID oifname "wg-exit-ru1" snat ip to 10.77.5.1
   }
 }
 NFT
 
+nft -c -f "$NFT_FILE"
 nft delete table inet cascade 2>/dev/null || true
 nft -f "$NFT_FILE"
 mkdir -p /etc/iproute2
