@@ -9,30 +9,11 @@ from urllib.parse import parse_qs
 
 WEIGHTS_FILE = "/etc/cascade/exit-weights.conf"
 CASCADE_HEALTH = "/usr/local/sbin/cascade-health"
-EXITS = [
-    {"name": "HELs-1", "iface": "wg-exit-hel1", "probe": "10.77.3.2", "expected_ip": "45.129.124.11", "weight": 10, "mode": "auto"},
-    {"name": "DE-1", "iface": "wg-exit-de1", "probe": "10.77.4.2", "expected_ip": "213.176.114.234", "weight": 10, "mode": "auto"},
-    {"name": "VIE-1", "iface": "wg-exit-vie1", "probe": "10.77.6.2", "expected_ip": "45.86.245.60", "weight": 10, "mode": "auto"},
-    {"name": "AMS-3", "iface": "wg-exit-ams3", "probe": "10.77.7.2", "expected_ip": "45.94.37.67", "weight": 10, "mode": "auto"},
-    {"name": "AMS-1", "iface": "wg-exit-ams1", "probe": "10.77.1.2", "expected_ip": "176.124.201.26", "weight": 3, "mode": "auto"},
-    {"name": "AMS-2", "iface": "wg-exit-ams2", "probe": "10.77.2.2", "expected_ip": "185.125.202.109", "weight": 1, "mode": "auto"},
-    {"name": "RU-Reserve", "iface": "wg-exit-ru1", "probe": "10.77.5.2", "expected_ip": "51.250.41.144", "weight": 0, "mode": "reserve"},
-]
+NETWORK_FILE = os.environ.get("CASCADE_NETWORK_FILE", "/etc/cascade/network.json")
+WIREGUARD_ONLY = os.environ.get("CASCADE_WIREGUARD_ONLY", "0").strip().lower() in ("1", "true", "yes")
+EXITS = []
 
-SERVICES = [
-    "wg-quick@wg-exit-hel1.service",
-    "wg-quick@wg-exit-de1.service",
-    "wg-quick@wg-exit-vie1.service",
-    "wg-quick@wg-exit-ams1.service",
-    "wg-quick@wg-exit-ams2.service",
-    "wg-quick@wg-exit-ru1.service",
-    "cascade-routing.service",
-    "cascade-health.timer",
-    "hysteria-server.service",
-    "hysteria-cert-sync.timer",
-    "docker.service",
-    "caddy.service",
-]
+BASE_SERVICES = ["cascade-routing.service", "cascade-health.timer", "docker.service", "caddy.service"]
 
 
 def run(cmd, timeout=4):
@@ -47,6 +28,42 @@ def run(cmd, timeout=4):
 
 def exit_key(exit_):
     return exit_["iface"].replace("wg-exit-", "")
+
+
+def configured_exits():
+    """Load portable exit metadata, while preserving the current deployment fallback."""
+    try:
+        with open(NETWORK_FILE, "r", encoding="utf-8") as f:
+            document = json.load(f)
+        source = document.get("exits", []) if isinstance(document, dict) else []
+        result = []
+        for index, item in enumerate(source, start=1):
+            if not isinstance(item, dict):
+                continue
+            iface = str(item.get("iface") or f"wg-exit-{index}").strip()
+            if not iface.replace("-", "").replace("_", "").isalnum():
+                continue
+            result.append({
+                "name": str(item.get("name") or iface),
+                "iface": iface,
+                "probe": str(item.get("probe") or item.get("exitAddress") or ""),
+                "expected_ip": str(item.get("expected_ip") or item.get("publicIp") or ""),
+                "weight": max(0, min(int(item.get("weight", 10)), 100)),
+                "mode": "reserve" if item.get("mode") == "reserve" else "auto",
+            })
+        if result:
+            return result
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return [dict(item) for item in EXITS]
+
+
+def monitored_services(exits):
+    services = [f"wg-quick@{item['iface']}.service" for item in exits]
+    services.extend(BASE_SERVICES)
+    if not WIREGUARD_ONLY:
+        services.extend(["hysteria-server.service", "hysteria-cert-sync.timer"])
+    return list(dict.fromkeys(services))
 
 
 def load_weight_overrides():
@@ -76,7 +93,7 @@ def load_weight_overrides():
 def effective_exits():
     overrides = load_weight_overrides()
     exits = []
-    for item in EXITS:
+    for item in configured_exits():
         exit_ = dict(item)
         key = exit_key(exit_)
         exit_["key"] = key
@@ -88,9 +105,10 @@ def effective_exits():
 
 
 def save_weights(params):
-    allowed = {exit_key(e) for e in EXITS if e.get("mode") != "reserve"}
+    configured = configured_exits()
+    allowed = {exit_key(e) for e in configured if e.get("mode") != "reserve"}
     lines = ["# Managed by cascade-monitor. Weight 0 disables an auto exit from balancing.\n"]
-    for e in EXITS:
+    for e in configured:
         key = exit_key(e)
         if key not in allowed:
             continue
@@ -138,9 +156,9 @@ def parse_wg_dump():
     return data
 
 
-def service_states():
+def service_states(exits):
     result = {}
-    for svc in SERVICES:
+    for svc in monitored_services(exits):
         r = run(f"systemctl is-active {svc}", 2)
         result[svc] = r["out"] or "unknown"
     return result
@@ -216,6 +234,8 @@ def wg_easy_ip():
 
 
 def hysteria_ip():
+    if WIREGUARD_ONLY:
+        return ""
     r = run("runuser -u hysteria -- curl -4 --max-time 6 -sS https://api.ipify.org", 8)
     return r["out"] if r["ok"] else ""
 
@@ -233,7 +253,7 @@ def collect():
     return {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "hostname": run("hostname", 2)["out"],
-        "services": service_states(),
+        "services": service_states(exits),
         "route_table_100": route,
         "exits": exits,
         "client_entrypoints": {
@@ -304,11 +324,10 @@ def render_html(data):
     route = data["route_table_100"]
     route_summary = route_label(route)
     wg_ip = data["client_entrypoints"]["wg_easy_container_external_ip"] or "n/a"
-    hy_ip = data["client_entrypoints"]["hysteria_process_external_ip"] or "n/a"
-    same_path = wg_ip != "n/a" and wg_ip == hy_ip
     active_name = active_exits[0]["name"] if active_exits else "нет активного выхода"
     active_ip = active_exits[0]["probe_result"].get("public_ip", "") if active_exits else ""
-    system_ok = all(v == "active" for v in data["services"].values())
+    required_services = {k: v for k, v in data["services"].items() if not k.startswith("caddy")}
+    system_ok = bool(required_services) and all(v == "active" for v in required_services.values())
     total_weight = sum(e["weight"] for e in auto_exits if exit_state(e))
 
     svc_rows = "".join(
@@ -365,21 +384,23 @@ def render_html(data):
 </tr>"""
         )
     counters = "\n".join(html.escape(x) for x in data["nft_counters"])
+    entry_metric = "" if WIREGUARD_ONLY else f'''<div class="panel"><div class="muted">Hysteria показывает</div><div class="metric">{html.escape(data["client_entrypoints"]["hysteria_process_external_ip"] or "n/a")}</div><div class="small">дополнительный вход</div></div>'''
+    input_title = "WireGuard" if WIREGUARD_ONLY else "WireGuard + Hysteria"
     return f"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60">
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VPN Cascade Monitor</title>
 <style>
-body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0d1013;color:#eef2f4}}main{{max-width:1220px;margin:0 auto;padding:28px}}h1{{font-size:28px;margin:0 0 6px}}h2{{font-size:18px;margin:28px 0 12px}}.muted,td span,.exit-grid span,.step span{{color:#9aa5ad}}.top{{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}}.grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}}.panel,.flow,.exit-card,details{{background:#171c21;border:1px solid #2a323a;border-radius:8px;padding:14px}}.metric{{font-size:26px;font-weight:750;margin-top:4px;line-height:1.15}}.small{{font-size:13px;color:#aeb7be}}.flow{{margin-top:16px;display:grid;grid-template-columns:1fr 40px 1fr 40px 1fr;gap:10px;align-items:stretch}}.step{{min-height:112px;background:#11161a;border:1px solid #2a323a;border-radius:8px;padding:14px}}.step b{{display:block;font-size:18px;margin:6px 0}}.arrow{{display:grid;place-items:center;color:#7f8b95;font-size:26px}}.exit-list{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}}.exit-card.live{{border-color:#2f6b4f}}.exit-card.reserve{{border-color:#75622b}}.exit-card.offline{{opacity:.72}}.exit-head{{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}}.exit-head strong{{display:block;font-size:17px}}.exit-head span{{display:block;font-size:12px;margin-top:2px}}.bar{{height:8px;background:#273039;border-radius:999px;overflow:hidden;margin:14px 0}}.bar i{{display:block;height:100%;background:#52d98d;border-radius:999px}}.exit-card.reserve .bar i{{width:100%!important;background:#d3a83b}}.exit-card.offline .bar i{{background:#6b747d}}.exit-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}.exit-grid b{{display:block;margin-top:3px;word-break:break-word}}.weights{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:12px 0}}.weight-row{{display:grid;grid-template-columns:1fr 82px;gap:10px;align-items:center;background:#11161a;border:1px solid #2a323a;border-radius:8px;padding:12px}}.weight-row small,.weight-row em{{display:block;color:#9aa5ad;font-size:12px;font-style:normal;margin-top:3px}}.weight-row input{{width:100%;box-sizing:border-box;border:1px solid #3b4955;border-radius:8px;background:#0d1216;color:#eef2f4;padding:9px;font:inherit}}button{{border:0;border-radius:8px;background:#3978f2;color:white;padding:11px 15px;font:inherit;font-weight:700;cursor:pointer}}button:hover{{filter:brightness(1.08)}}table{{width:100%;border-collapse:collapse;background:#171c21;border:1px solid #2a323a;border-radius:8px;overflow:hidden}}td,th{{text-align:left;padding:10px;border-bottom:1px solid #2a323a;vertical-align:top}}th{{color:#c8d0d6;background:#20262c}}.badge{{display:inline-block;border-radius:999px;padding:3px 8px;font-size:12px;background:#3a4148;color:#dbe2e7;margin:1px;white-space:nowrap}}.ok{{background:#153d2a;color:#92efbd}}.bad{{background:#4a2020;color:#ffb1a8}}.warn{{background:#4c3e16;color:#ffd86e}}pre{{white-space:pre-wrap;background:#11161a;border:1px solid #2a323a;border-radius:8px;padding:12px;overflow:auto}}summary{{cursor:pointer;color:#dfe7ec;font-weight:650}}a{{color:#8cc8ff}}@media(max-width:900px){{.grid,.exit-list,.flow,.weights{{grid-template-columns:1fr}}.arrow{{display:none}}td,th{{font-size:13px}}.top{{display:block}}}}
+:root{{--ink:#e7f3ff;--muted:#8ea9c4;--sky:#020812;--panel:#061426;--panel2:#04111f;--line:#173f65;--mint:#4ebeff;--sun:#83dfff;--danger:#ff8da9;color-scheme:dark}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;font-family:ui-monospace,"Cascadia Mono","Segoe UI Mono",monospace;background-color:var(--sky);background-image:linear-gradient(rgba(63,137,196,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(63,137,196,.025) 1px,transparent 1px);background-size:22px 22px;color:var(--ink)}}main{{max-width:1220px;margin:0 auto;padding:28px}}h1{{font-size:28px;margin:0 0 6px}}h2{{font-size:18px;margin:28px 0 12px;color:var(--sun)}}.muted,td span,.exit-grid span,.step span{{color:var(--muted)}}.top,.toolbar{{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}}.toolbar{{align-items:center;justify-content:flex-end;flex-wrap:wrap}}.grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}}.panel,.flow,.exit-card,details{{background:rgba(6,20,38,.92);border:1px solid var(--line);border-radius:12px;padding:14px;box-shadow:4px 4px 0 #01040a}}.metric{{font-size:26px;font-weight:800;margin-top:4px;line-height:1.15;color:var(--sun)}}.small{{font-size:13px;color:var(--muted)}}.flow{{margin-top:16px;display:grid;grid-template-columns:1fr 40px 1fr 40px 1fr;gap:10px;align-items:stretch}}.step{{min-height:112px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}}.step b{{display:block;font-size:18px;margin:6px 0}}.arrow{{display:grid;place-items:center;color:var(--sun);font-size:26px}}.exit-list{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}}.exit-card.live{{border-color:#2f8b67}}.exit-card.reserve{{border-color:#8b742f}}.exit-card.offline{{opacity:.72}}.exit-head{{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}}.exit-head strong{{display:block;font-size:17px}}.exit-head span{{display:block;font-size:12px;margin-top:2px}}.bar{{height:8px;background:#0a2239;border-radius:999px;overflow:hidden;margin:14px 0}}.bar i{{display:block;height:100%;background:var(--mint);border-radius:999px}}.exit-card.reserve .bar i{{width:100%!important;background:#d3a83b}}.exit-card.offline .bar i{{background:#48637a}}.exit-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}.exit-grid b{{display:block;margin-top:3px;word-break:break-word}}.weights{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:12px 0}}.weight-row{{display:grid;grid-template-columns:1fr 82px;gap:10px;align-items:center;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px}}.weight-row small,.weight-row em{{display:block;color:var(--muted);font-size:12px;font-style:normal;margin-top:3px}}.weight-row input,select{{width:100%;border:1px solid #315f80;border-radius:8px;background:#020b15;color:var(--ink);padding:9px;font:inherit}}button,.button{{border:1px solid #5ecbff;border-radius:8px;background:#0b2d4c;color:var(--ink);padding:10px 13px;font:inherit;font-weight:800;cursor:pointer;text-decoration:none}}button:hover,.button:hover{{filter:brightness(1.15)}}table{{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);overflow:hidden}}td,th{{text-align:left;padding:10px;border-bottom:1px solid var(--line);vertical-align:top}}th{{color:var(--sun);background:#09213a}}.badge{{display:inline-block;border-radius:999px;padding:3px 8px;font-size:12px;background:#20364a;color:var(--ink);margin:1px;white-space:nowrap}}.ok{{background:#123c31;color:#92efbd}}.bad{{background:#4a2030;color:#ffb1c4}}.warn{{background:#4c3e16;color:#ffd86e}}pre{{white-space:pre-wrap;background:#020b15;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto}}summary{{cursor:pointer;color:var(--sun);font-weight:800}}a{{color:var(--sun)}}@media(max-width:900px){{main{{padding:14px}}.grid,.exit-list,.flow,.weights{{grid-template-columns:1fr}}.arrow{{display:none}}td,th{{font-size:13px}}.top{{display:block}}.toolbar{{justify-content:flex-start;margin-top:14px}}}}
 </style></head><body><main>
-<div class="top"><div><h1>VPN Cascade Monitor</h1><div class="muted">{html.escape(data['hostname'])} · {html.escape(data['generated_at'])} · автообновление 60с · <a href="api">JSON</a></div></div><div>{badge(system_ok, 'сервисы OK' if system_ok else 'есть проблема')}</div></div>
+<div class="top"><div><h1>VPN Cascade Monitor</h1><div class="muted">{html.escape(data['hostname'])} · <span id="generated">{html.escape(data['generated_at'])}</span> · <span id="countdown">обновление через 60с</span></div></div><div class="toolbar"><select id="interval" aria-label="Интервал обновления"><option value="15">15с</option><option value="30">30с</option><option value="60" selected>60с</option><option value="0">пауза</option></select><button type="button" onclick="location.reload()">Обновить</button><button type="button" id="copyJson">Скопировать JSON</button><a class="button" href="api" download="cascade-status.json">JSON</a>{badge(system_ok, 'серввисы OK' if system_ok else 'есть проблема')}</div></div>
 <section class="grid">
   <div class="panel"><div class="muted">Активный выход</div><div class="metric">{html.escape(active_name)}</div><div class="small">{html.escape(active_ip or route_summary)}</div></div>
   <div class="panel"><div class="muted">Доступно авто-выходов</div><div class="metric">{len(active_exits)} / {configured_exits}</div><div class="small">резервов готово: {len(ready_reserves)}</div></div>
   <div class="panel"><div class="muted">wg-easy показывает</div><div class="metric">{html.escape(wg_ip)}</div><div class="small">WireGuard-клиенты</div></div>
-  <div class="panel"><div class="muted">Hysteria Auto показывает</div><div class="metric">{html.escape(hy_ip)}</div><div class="small">{'тот же путь' if same_path else 'отличается от wg-easy'}</div></div>
+  {entry_metric}
 </section>
 <section class="flow">
-  <div class="step"><span>Входы</span><b>WireGuard + Hysteria</b><div class="small">wg-easy: {html.escape(wg_ip)}<br>Hysteria: {html.escape(hy_ip)}</div></div>
+  <div class="step"><span>Вход</span><b>{input_title}</b><div class="small">wg-easy: {html.escape(wg_ip)}</div></div>
   <div class="arrow">→</div>
   <div class="step"><span>Решение маршрута</span><b>{html.escape(route_summary)}</b><div class="small">RU/direct остаются в Москве, остальное идет в table 100</div></div>
   <div class="arrow">→</div>
@@ -397,7 +418,12 @@ body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;backgroun
 <h2>Services</h2><table><tbody>{svc_rows}</tbody></table>
 <h2>nft counters</h2><pre>{counters}</pre>
 </details>
-</main></body></html>"""
+</main><script>
+const select=document.getElementById('interval'), label=document.getElementById('countdown');let left=60,timer=null;
+function schedule(){{clearInterval(timer);left=Number(select.value);if(!left){{label.textContent='автообновление на паузе';return}}timer=setInterval(()=>{{left-=1;label.textContent=`обновление через ${{left}}с`;if(left<=0)location.reload()}},1000)}}
+select.addEventListener('change',schedule);schedule();
+document.getElementById('copyJson').addEventListener('click',async e=>{{try{{const text=await fetch('api',{{cache:'no-store'}}).then(r=>r.text());await navigator.clipboard.writeText(text);e.currentTarget.textContent='JSON скопирован'}}catch(_err){{e.currentTarget.textContent='Не удалось скопировать'}}}});
+</script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
